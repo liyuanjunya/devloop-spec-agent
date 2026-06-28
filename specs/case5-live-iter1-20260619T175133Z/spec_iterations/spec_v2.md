@@ -1,0 +1,368 @@
+# Feature Specification: Meal Plan auto-sync to Shopping List
+
+**Feature ID**: `case5-live-iter1-20260619T175133Z`
+**Schema version**: 1.0
+
+## Summary
+
+Add a per-household preference that, when enabled, automatically pushes the recipes scheduled in today's meal plan into a configured target shopping list. Per-household state lives on `HouseholdPreferencesModel` (four client-writable columns plus a server-owned `last_auto_synced_at` idempotency marker) and on a new `household_pantry_staples(household_id, food_id)` association table parallel to `households_to_ingredient_foods`, so pantry-staple flags are isolated per household and never bleed across households in the same group. The scheduler is registered via `SchedulerRegistry.register_minutely` (the existing 5-minute bucket) and each tick computes a household-local `scheduled_local_instant = today_in_household_tz at auto_sync_run_time`, gating execution to runs whose `household_local_now()` falls inside `[scheduled_local_instant, scheduled_local_instant + 30 minutes)`. Idempotency is enforced by a single conditional UPDATE on `last_auto_synced_at` issued AFTER preconditions (target list ownership, today's meal plan non-empty) succeed and AFTER `bulk_create_items` + recipe-reference update + event dispatch all commit; no-op and failure paths never touch the marker. Pantry filtering is unconditional and operates on the fully-flattened ingredient list (including sub-recipes via the recursive expansion at `shopping_lists.py:343-355`), with the per-household predicate sourced from the new association table. The canonical merge seam is `ShoppingListService.bulk_create_items` (`shopping_lists.py:154-220`), which already accumulates quantity into existing unchecked `(food_id, unit_id)` rows via `can_merge`+`merge_items`. A new `EventTypes.mealplan_auto_synced_to_shopping` event carries `EventMealPlanAutoSyncedData(operation, household_id, shopping_list_id, added_item_count, skipped_pantry_count)` and is dispatched once per successful sync. New routes: `PATCH /api/households/preferences` (partial update via `HouseholdPreferencesPartialUpdate` with all-optional fields excluding the server-owned marker) and `POST /api/households/preferences/auto-sync-shopping/run-now` (household-admin only, `force=True` bypasses the daily CAS guard but still writes the marker on success, returns the exact shape `{added_count, skipped_pantry_count, target_list_id, run_at}`). Three i18n keys are added under the unqualified hyphenated namespace `auto-sync.no-meal-plan-today`, `auto-sync.no-target-list`, `auto-sync.already-synced-today` in `mealie/lang/messages/en-US.json` per the en-US-only convention.
+
+## NEEDS_CLARIFICATION (blocking decisions)
+
+### NC-001 — Per-household pantry-staple isolation via association table
+
+**Conflict**: Input requirement 4 reads literally 'add Boolean is_pantry_staple on the foods table', but `IngredientFoodModel` is group-scoped (one row shared by every household in the same group). A bare column on that table is shared across every household in the group and directly contradicts the input requirement 5 multitenant isolation rule that one household's pantry-staple marking must not bleed into another household's auto-sync. Meta-review META-001 escalates this to a blocking architectural decision.
+
+**Recommended default**: Add a new association table `household_pantry_staples(household_id, food_id)` modeled exactly on `households_to_ingredient_foods` (`mealie/db/models/recipe/ingredient.py:21-27`). Add a relationship `IngredientFoodModel.households_with_pantry_staple` and a back-reference `Household.pantry_staple_foods`. The pantry filter predicate reads from this association table, scoped to the current household. Admin route writes toggle the association row rather than a column on the food. Drop the literal column-on-foods interpretation.
+
+**If rejected**: Implement the literal interpretation (group-scoped `IngredientFoodModel.is_pantry_staple` boolean) and accept the documented behavioral leak: marking flour as a staple in household A will silently suppress flour from household B's auto-sync output. Drop FR-002 and replace with an `is_pantry_staple` column on `IngredientFoodModel`. Drop FR-025 and extend `IngredientFoodsController.update_one` to accept the new field via the existing `SaveIngredientFood` payload. The multitenant pantry-staple isolation test in FR-027 becomes unimplementable and must be removed.
+
+**Related**: FR-002, FR-016, FR-025, FR-027
+
+### NC-002 — Default target shopping list when auto_sync_target_shopping_list_id is null
+
+**Conflict**: Input requirement 1 specifies the auto-sync target list defaults to 'the household's first active main list when null'. Mealie has no concept of an 'active main' shopping list — every `ShoppingList` row is equal. The chosen ordering (creation order, alphabetical, smallest GUID) materially changes which list receives the sync.
+
+**Recommended default**: Use the household's first shopping list ordered by `ShoppingList.created_at` ascending (FR-013). `created_at` is inherited from `SqlAlchemyBase` at `mealie/db/models/_model_base.py:18-23` and aligns with operator intuition of 'first' since lists are created in chronological order. The query is `repos.group_shopping_lists.page_all(PaginationQuery(per_page=1, order_by='created_at', order_direction=OrderDirection.asc))`. When zero non-deleted shopping lists belong to the household, the task dispatches the `auto-sync.no-target-list` localized warning and aborts without touching `last_auto_synced_at`.
+
+**If rejected**: Replace the `created_at` ORDER BY in FR-013 with the reviewer's chosen alternative. Two candidate alternatives exist: alphabetical on `ShoppingList.name` ascending, or smallest GUID lexicographic order. Update the FR-013 query, SC-013, and the integration test in FR-026 to assert the new ordering. Reviewer must pick one alternative before coding.
+
+**Related**: FR-013
+
+### NC-003 — PATCH semantics treat last_auto_synced_at as server-owned and not client-writable
+
+**Conflict**: Input requirement 1 specifies a PATCH endpoint with `exclude_unset` semantics, but is silent on whether `last_auto_synced_at` is included in the writable surface. META-008 and META-012 require excluding the server-owned marker from the PATCH/PUT bodies; otherwise a client could clear or backdate it and break the daily-sync guarantee.
+
+**Recommended default**: Define `HouseholdPreferencesPartialUpdate(MealieModel)` (FR-004) with all four writable fields as `Optional[...] = None`, EXCLUDING `last_auto_synced_at`. Apply the diff via `model_dump(exclude_unset=True)` and merge into the loaded row field-by-field, bypassing the generic `repository_generic.update()` full-model path. The existing PUT body (`UpdateHouseholdPreferences` at `mealie/schema/household/household_preferences.py:10-22`) is extended with the four writable fields but also omits `last_auto_synced_at`. The Read schema retains the marker for diagnostics. An explicit `null` for `auto_sync_target_shopping_list_id` (nullable column) clears the field; an explicit `null` for `auto_sync_meal_plan_to_shopping` (non-null column) is rejected with HTTP 422.
+
+**If rejected**: Allow `last_auto_synced_at` in PATCH/PUT bodies. FR-003, FR-004, and FR-006 must change to include the field. The idempotency contract in FR-011 / FR-012 must be amended to account for client backdating, and a new validation rule must reject monotonicity violations (PATCH cannot rewind the marker further than 7 days into the past, or any other reviewer-chosen guard). The SC-001 PATCH round-trip test must also exercise the marker field. NOTE: this is the path explicitly disrecommended by META-008.
+
+**Related**: FR-003, FR-004, FR-005, FR-006, FR-011
+
+## User Scenarios & Testing
+
+### US-1 — Household administrator enables auto-sync (Priority: P1)
+
+As a household administrator, I want to toggle on automatic meal-plan-to-shopping-list sync, pick the target shopping list, and set the daily run time, so my weekly grocery list is built without manual clicks.
+
+**Why this priority**: Core configuration surface that gates every downstream behavior.
+
+**Independent test**: PATCH /api/households/preferences with auto_sync_meal_plan_to_shopping=true, auto_sync_target_shopping_list_id=<list-id>, and auto_sync_run_time='07:30'; GET /api/households/preferences returns the same values.
+
+**Acceptance Scenarios**:
+
+1. **Given** a household with at least one shopping list and a user with can_manage_household=true, **When** the user PATCHes /api/households/preferences with auto_sync_meal_plan_to_shopping=true, a valid household-owned auto_sync_target_shopping_list_id, and auto_sync_run_time='07:30', **Then** the response body contains the updated values and a subsequent GET returns identical values
+2. **Given** a household preference document with auto_sync_meal_plan_to_shopping=true, **When** the user PATCHes /api/households/preferences with auto_sync_meal_plan_to_shopping=false, **Then** the scheduled task skips this household on its next tick and no shopping_list_item rows are written for this household
+
+### US-2 — Scheduled task syncs today's meal plan into the shopping list (Priority: P1)
+
+As a household member, I want today's planned recipes to appear in my chosen shopping list within the 30-minute window after my configured auto_sync_run_time, so I do not have to remember to copy ingredients over manually.
+
+**Why this priority**: Primary value delivery — without this the feature does nothing.
+
+**Independent test**: Seed a GroupMealPlan row for today, enable auto_sync_meal_plan_to_shopping with auto_sync_run_time='00:00', invoke the registered task callback inside the 30-minute window, assert the target list contains the recipe ingredients and last_auto_synced_at is set.
+
+**Acceptance Scenarios**:
+
+1. **Given** a household with auto_sync_meal_plan_to_shopping=true, auto_sync_run_time='00:00', and a meal plan dated today in the household timezone, **When** the registered minutely task fires inside [00:00, 00:30) household-local, **Then** the recipes' ingredients are merged into the configured target list and last_auto_synced_at is set to current UTC time
+2. **Given** the task was already invoked once for today (last_auto_synced_at >= today's local-day boundary), **When** the task fires again within the same household-local day, **Then** no new items are added, no event is dispatched, and last_auto_synced_at is not bumped
+
+### US-3 — Household administrator triggers an on-demand sync (Priority: P1)
+
+As a household administrator, I want a manual run-now action so I can sync immediately after editing today's meal plan without waiting for the next scheduler tick, even when the daily CAS marker has already been set.
+
+**Why this priority**: Direct workflow gap that the input requirements call out explicitly.
+
+**Independent test**: POST /api/households/preferences/auto-sync-shopping/run-now as a can_manage_household user; assert HTTP 200 and that the response body has the exact shape {added_count, skipped_pantry_count, target_list_id, run_at}.
+
+**Acceptance Scenarios**:
+
+1. **Given** a user with can_manage_household=true, a household configured for auto-sync, and last_auto_synced_at already set to today, **When** the user POSTs to /api/households/preferences/auto-sync-shopping/run-now, **Then** the synchroniser executes for this household synchronously bypassing the daily CAS guard, the target list receives the expected items, last_auto_synced_at is updated, and the response body returns {added_count, skipped_pantry_count, target_list_id, run_at} with concrete integer counts
+2. **Given** a user without can_manage_household permission, **When** the user POSTs to /api/households/preferences/auto-sync-shopping/run-now, **Then** the response status is 403 Forbidden and no shopping-list items are created
+
+### US-4 — Pantry-staple filter skips already-stocked foods per household (Priority: P2)
+
+As a household member, I want ingredients that MY household has marked as pantry staples to be skipped during auto-sync, so the shopping list only contains items we still need to buy — and another household's pantry-staple choices never affect ours.
+
+**Why this priority**: Quality-of-life filter that reduces manual list pruning; multitenant correctness is a hard requirement.
+
+**Independent test**: Add a (household_id, food_id) row to household_pantry_staples for the household, run the task, assert no shopping_list_item references that food_id in this household's target list, and a sibling household in the same group whose pantry row is absent still receives the same food.
+
+**Acceptance Scenarios**:
+
+1. **Given** a household_pantry_staples row pointing to a food F for household A, and a recipe ingredient pointing to food F, **When** the auto-sync task runs for household A, **Then** food F is excluded from items added to household A's target list
+2. **Given** household A has marked food F as pantry-staple but household B (same group) has not, **When** the auto-sync task runs for household B, **Then** food F is INCLUDED in items added to household B's target list
+
+### US-5 — Event bus subscribers learn about each auto-sync (Priority: P2)
+
+As an integration developer subscribed to the new mealplan_auto_synced_to_shopping event, I want to receive a payload describing each auto-sync action so my downstream webhook or Apprise alert fires reliably with non-PII counts.
+
+**Why this priority**: Existing notifier integrations rely on event_types for downstream automation.
+
+**Independent test**: Mock the event bus, run the task end-to-end, assert dispatch was called once with EventTypes.mealplan_auto_synced_to_shopping and an EventMealPlanAutoSyncedData payload carrying household_id, shopping_list_id, added_item_count, skipped_pantry_count, and operation.
+
+**Acceptance Scenarios**:
+
+1. **Given** a household with a webhook subscriber listening for mealplan_auto_synced_to_shopping, **When** auto-sync runs successfully, **Then** EventBusService.dispatch is invoked exactly once with EventTypes.mealplan_auto_synced_to_shopping and an EventMealPlanAutoSyncedData payload containing household_id, shopping_list_id, added_item_count, skipped_pantry_count, and EventOperation
+
+### US-6 — Multi-tenant isolation across households (Priority: P2)
+
+As a household administrator in household A, I want the assurance that running auto-sync never modifies a shopping list owned by household B, even when both households share a group, and even if my auto_sync_target_shopping_list_id has been set to a sibling household's list by mistake.
+
+**Why this priority**: Hard correctness boundary — a leakage bug is a critical incident.
+
+**Independent test**: Create two households in the same group; configure auto-sync only for household A (including a sneaky attempt to set A's auto_sync_target_shopping_list_id to one of B's lists); run the task; assert household B's lists are byte-identical before and after, and the cross-household target id is rejected at PATCH time AND at sync time.
+
+**Acceptance Scenarios**:
+
+1. **Given** two households A and B in the same group, both with shopping lists, **When** auto-sync runs for household A, **Then** every shopping_list row belonging to household B is unchanged
+2. **Given** household A attempts to PATCH /api/households/preferences with auto_sync_target_shopping_list_id pointing to household B's list, **When** the PATCH is submitted, **Then** the response is HTTP 422 and the household_preferences row for A is unchanged
+
+### US-7 — Household administrator marks a food as a pantry staple for this household only (Priority: P2)
+
+As a household administrator with can_manage_household permission, I want to toggle the pantry-staple flag for a food within MY household so the pantry filter has per-household data to act on, without affecting any other household.
+
+**Why this priority**: Without a way to set the per-household flag, the pantry-filter feature is unreachable.
+
+**Independent test**: POST /api/households/self/pantry-staples/{food_id} as a can_manage_household user; assert a household_pantry_staples row is inserted for (current_household_id, food_id); DELETE /api/households/self/pantry-staples/{food_id} removes only that row.
+
+**Acceptance Scenarios**:
+
+1. **Given** a user with can_manage_household=true and a food F in the current group, **When** the user POSTs /api/households/self/pantry-staples/{F.id}, **Then** a (household_id=self.household_id, food_id=F.id) row exists in household_pantry_staples and no other household's pantry-staple rows are affected
+
+### US-8 — Household configures a timezone so today reflects the locale (Priority: P3)
+
+As a household administrator in a non-UTC region, I want to set the household timezone so the daily auto-sync window respects my local midnight rather than the server's UTC midnight.
+
+**Why this priority**: Required for correctness in non-UTC deployments; tagged P3 because a null timezone falls back to UTC and still works.
+
+**Independent test**: Set HouseholdPreferences.timezone='Asia/Shanghai' and auto_sync_run_time='00:00'; freeze the wall clock at 16:05 UTC on 2026-06-19 (00:05 on 2026-06-20 in Shanghai); invoke the task; assert it picks up the GroupMealPlan with date=2026-06-20.
+
+**Acceptance Scenarios**:
+
+1. **Given** a household with timezone='Asia/Shanghai', auto_sync_run_time='00:00', and a meal plan dated 2026-06-20 (Shanghai local), **When** the task runs at 16:05 UTC on 2026-06-19 (i.e., 00:05 on 2026-06-20 in Shanghai), **Then** the meal plan for 2026-06-20 is selected as today and synced
+
+### US-9 — Operator sees localized success and error messages (Priority: P2)
+
+As an operator reading the API response or webhook payload, I want localized strings drawn from the en-US locale so the system message format matches every other Mealie endpoint, and the message keys match the input specification verbatim.
+
+**Why this priority**: Consistency with the repo-wide en-US-only locale convention and input requirement 4.
+
+**Independent test**: Trigger run-now with no active meal plan; assert the response body's localized message key equals exactly auto-sync.no-meal-plan-today.
+
+**Acceptance Scenarios**:
+
+1. **Given** a household with no meal plan for today, **When** run-now is invoked, **Then** the response contains the localized string registered under the key auto-sync.no-meal-plan-today (exact match)
+2. **Given** a household whose auto_sync_target_shopping_list_id has been set to a deleted list, **When** the auto-sync task runs, **Then** the localized warning logged uses the key auto-sync.no-target-list (exact match) and last_auto_synced_at is NOT bumped
+
+## Requirements
+
+### Functional Requirements
+
+- **FR-001** [FR]: Extend `HouseholdPreferencesModel` (mealie/db/models/household/preferences.py:16-44) with four client-writable columns plus one server-owned idempotency marker. Writable: `auto_sync_meal_plan_to_shopping: bool NOT NULL DEFAULT false`, `auto_sync_target_shopping_list_id: GUID NULL (foreign key to shopping_lists.id, ON DELETE SET NULL)`, `auto_sync_run_time: str NOT NULL DEFAULT '00:00'` (HH:MM 24h format), and `timezone: str NULL` (IANA Olson zone string, defaults to UTC on null). Server-owned: `last_auto_synced_at: datetime NULL` typed as `NaiveDateTime` (mealie/db/models/_model_utils/datetime.py:1-50) so all stored timestamps are naive-UTC and re-injected with `tzinfo=UTC` on read. No `auto_sync_pantry_filter_enabled` column is added — pantry filtering is unconditional per FR-016.
+  - Code references: `mealie/db/models/household/preferences.py` L16-44 (HouseholdPreferencesModel, household_id, show_announcements), `mealie/db/models/_model_utils/datetime.py` L1-50 (NaiveDateTime, process_bind_param, process_result_value)
+  - Related: US-1, US-2, US-3, US-8
+- **FR-002** [FR]: Add a new association table `household_pantry_staples(household_id GUID FK households.id ON DELETE CASCADE, food_id GUID FK ingredient_foods.id ON DELETE CASCADE, UNIQUE (household_id, food_id))` modeled byte-for-byte on `households_to_ingredient_foods` (mealie/db/models/recipe/ingredient.py:21-27). Add a new relationship `IngredientFoodModel.households_with_pantry_staple` paired with a back-reference `Household.pantry_staple_foods` so the secondary join works in both directions. NOT a column on `IngredientFoodModel` (which is group-scoped at mealie/db/models/recipe/ingredient.py:153-192 and would leak across households per NC-001). The membership row IS the staple flag — INSERT marks a food as a staple for that household; DELETE clears it.
+  - Code references: `mealie/db/models/recipe/ingredient.py` L21-27 (households_to_ingredient_foods, household_id, food_id), `mealie/db/models/recipe/ingredient.py` L153-192 (IngredientFoodModel, households_with_ingredient_food), `mealie/db/models/household/household.py` L29-97 (Household, ingredient_foods_on_hand)
+  - Related: US-4, US-7
+- **FR-003** [FR]: Extend `UpdateHouseholdPreferences` (mealie/schema/household/household_preferences.py:10-22) with the four new writable fields exactly: `auto_sync_meal_plan_to_shopping: bool = False`, `auto_sync_target_shopping_list_id: UUID4 | None = None`, `auto_sync_run_time: str = '00:00'` (validated against regex `^([01]\d|2[0-3]):[0-5]\d$`), and `timezone: str | None = None` (validated by attempting `zoneinfo.ZoneInfo(value)`; raises HTTP 422 on `ZoneInfoNotFoundError`). The schema does NOT include `last_auto_synced_at` — per NC-003 the marker is server-owned and never accepted from clients. Backward compatibility: existing fields keep their current defaults.
+  - Code references: `mealie/schema/household/household_preferences.py` L10-22 (UpdateHouseholdPreferences, private_household, show_announcements)
+  - Related: US-1
+- **FR-004** [FR]: Add a new pydantic schema `HouseholdPreferencesPartialUpdate(MealieModel)` in `mealie/schema/household/household_preferences.py` whose every field is `Optional[...] = None`. The four new auto-sync fields appear as `auto_sync_meal_plan_to_shopping: bool | None = None`, `auto_sync_target_shopping_list_id: UUID4 | None = None`, `auto_sync_run_time: str | None = None`, `timezone: str | None = None`. The PATCH route (FR-006) applies the diff via `payload.model_dump(exclude_unset=True)` so unset fields are not touched. An explicit JSON `null` for `auto_sync_target_shopping_list_id` (nullable column) clears the field; an explicit `null` for `auto_sync_meal_plan_to_shopping` (non-null column) is rejected with HTTP 422. The schema MUST NOT include `last_auto_synced_at` for the same reason as FR-003.
+  - Code references: `mealie/schema/household/household_preferences.py` L10-25 (UpdateHouseholdPreferences, CreateHouseholdPreferences)
+  - Related: US-1
+- **FR-005** [FR]: Extend `ReadHouseholdPreferences` (mealie/schema/household/household_preferences.py:32-40) to expose all five new fields including `last_auto_synced_at: datetime | None`. The Read schema is the diagnostics surface and IS allowed to return the marker so operators can see when the household was last auto-synced. `model_config = ConfigDict(from_attributes=True)` is preserved so the marker passes through from the ORM model untouched.
+  - Code references: `mealie/schema/household/household_preferences.py` L32-40 (ReadHouseholdPreferences, from_attributes)
+  - Related: US-1
+- **FR-006** [FR]: Add a new route `PATCH /api/households/preferences` on `HouseholdSelfServiceController` (mealie/routes/households/controller_household_self_service.py:20-62). Body type: `HouseholdPreferencesPartialUpdate` (FR-004). Guard: `self.checks.can_manage_household()` (mealie/routes/_base/checks.py:23-26). Pipeline: (1) load the current preferences row via `self.repos.household_preferences.get_one(self.household_id, 'household_id')` which is household-scoped so only this household's row is reachable; (2) compute `diff = payload.model_dump(exclude_unset=True)`; (3) if `'auto_sync_target_shopping_list_id' in diff` and the value is not None, look up `self.repos.group_shopping_lists.get_one(diff['auto_sync_target_shopping_list_id'])` using the household-scoped repo and raise HTTP 422 if it returns None (cross-household ids are filtered out by the scope) — per FR-014 / NC-001 this is the PATCH-time ownership validation; (4) for each `key, value` in `diff` set `setattr(current, key, value)`; (5) commit via `self.repos.household_preferences.update(self.household_id, current)`; (6) return `ReadHouseholdPreferences.model_validate(current)`. Response model: `ReadHouseholdPreferences`.
+  - Code references: `mealie/routes/households/controller_household_self_service.py` L20-62 (HouseholdSelfServiceController, update_household_preferences, can_manage_household), `mealie/routes/_base/checks.py` L23-26 (can_manage_household)
+  - Related: US-1, US-6
+- **FR-007** [FR]: Preserve the existing route `PUT /api/households/preferences` (mealie/routes/households/controller_household_self_service.py:58-62) so the new writable fields are also reachable via full replacement. The existing handler `update_household_preferences(new_pref: UpdateHouseholdPreferences)` continues to call `self.repos.household_preferences.update(self.household_id, new_pref)`; the only behavior change is the four new fields surfaced by `UpdateHouseholdPreferences` per FR-003. `last_auto_synced_at` remains excluded from this payload.
+  - Code references: `mealie/routes/households/controller_household_self_service.py` L58-62 (update_household_preferences, UpdateHouseholdPreferences)
+  - Related: US-1
+- **FR-008** [FR]: Create a new task module `mealie/services/scheduler/tasks/auto_sync_meal_plan_to_shopping.py` exposing the top-level callable `auto_sync_meal_plan_to_shopping_lists()`. Register the callable in `mealie/services/scheduler/tasks/__init__.py` and call `SchedulerRegistry.register_minutely(auto_sync_meal_plan_to_shopping_lists)` (mealie/services/scheduler/scheduler_registry.py:42-43) during app startup. The `register_minutely` bucket fires every `MINUTES_5` (5 minutes) per mealie/services/scheduler/scheduler_service.py:15-17 and mealie/services/scheduler/scheduler_service.py:77-81; window gating (FR-009) selects which ticks actually run the per-household work.
+  - Code references: `mealie/services/scheduler/scheduler_registry.py` L8-49 (SchedulerRegistry, register_minutely, _minutely), `mealie/services/scheduler/scheduler_service.py` L15-81 (MINUTES_5, run_minutely, SchedulerService)
+  - Related: US-2, US-5
+- **FR-009** [FR]: Each `auto_sync_meal_plan_to_shopping_lists()` tick iterates households whose `auto_sync_meal_plan_to_shopping = true`. Per household: resolve `tz = ZoneInfo(household.preferences.timezone) if household.preferences.timezone else ZoneInfo('UTC')`, compute `household_local_now = datetime.now(tz)`, parse `auto_sync_run_time` via `datetime.strptime(value, '%H:%M').time()`, build `scheduled_local_instant = household_local_now.replace(hour=run_time.hour, minute=run_time.minute, second=0, microsecond=0)`. Gate: skip unless `scheduled_local_instant <= household_local_now < scheduled_local_instant + timedelta(minutes=30)`. The 30-minute window covers the worst-case 5-minute scheduler tick interval (MINUTES_5 per FR-008) with margin for slow processing. The manual run-now path (FR-020) sets `force=True` and bypasses the gate.
+  - Code references: `mealie/services/scheduler/scheduler_service.py` L15-17, 77-81 (MINUTES_5, run_minutely)
+  - Related: US-2, US-3, US-8
+- **FR-010** [FR]: Resolve today's meal plan using the household timezone. Per household, after the FR-009 window check passes, invoke `repos.meals.get_today(tz=tz)` (mealie/repos/repository_meals.py:11-21) where `tz` is the `ZoneInfo` computed in FR-009. This selects `GroupMealPlan` rows where `date == datetime.now(tz=tz).date()` AND `household_id == self.household_id`. When `HouseholdPreferences.timezone` is null, the resolution path passes `ZoneInfo('UTC')` so the existing UTC behavior is preserved bit-for-bit. The empty-list case is handled by FR-011 (skip with no-op + i18n warning, no marker update).
+  - Code references: `mealie/repos/repository_meals.py` L11-21 (get_today, household_id, RepositoryMeals)
+  - Related: US-8
+- **FR-011** [FR]: Critical ordering: (1) resolve preconditions FIRST — target list lookup via household-scoped `self.repos.group_shopping_lists.get_one(target_id)` (returns None if the id does not belong to this household, per FR-014), today's meal plan via `repos.meals.get_today(tz=tz)` (FR-010); (2) IF target lookup returns None OR meal plan is empty: log the i18n warning (auto-sync.no-target-list or auto-sync.no-meal-plan-today per FR-022), DO NOT bump `last_auto_synced_at`, return; (3) build the `ShoppingListAddRecipeParamsBulk` items (FR-015); (4) open a single DB transaction and within it call `ShoppingListService.add_recipe_ingredients_to_list` (mealie/services/household_services/shopping_lists.py:413-455) which internally delegates to `bulk_create_items` (mealie/services/household_services/shopping_lists.py:154-220) and updates the list-level `recipe_references`; (5) dispatch the event (FR-021); (6) ONLY on successful commit, issue the conditional UPDATE on `last_auto_synced_at` (FR-012). Any exception during steps 3-5 leaves the marker untouched and rolls back the transaction.
+  - Code references: `mealie/services/household_services/shopping_lists.py` L154-220, 413-455 (add_recipe_ingredients_to_list, bulk_create_items)
+  - Related: US-2, US-3
+- **FR-012** [FR]: Idempotency under multi-replica deployment uses a conditional UPDATE: `UPDATE household_preferences SET last_auto_synced_at = :now WHERE id = :pref_id AND (last_auto_synced_at IS NULL OR last_auto_synced_at < :today_local_midnight_utc)`. `:today_local_midnight_utc` is computed as `datetime.combine(household_local_now.date(), time.min, tzinfo=tz).astimezone(UTC).replace(tzinfo=None)` so the comparison runs against a naive-UTC datetime matching the `NaiveDateTime` column type (mealie/db/models/_model_base.py:18-23). If the UPDATE affects 0 rows, the household was already synced today by another replica — log a debug message and continue without redoing the work. The check runs AFTER the successful commit of steps 4-5 in FR-011 (so if the CAS loses the race, the duplicate-add side-effect has already been applied; this is acceptable because `bulk_create_items` merges duplicate (food_id, unit_id) rows into existing unchecked entries via `can_merge` rather than creating duplicates).
+  - Code references: `mealie/db/models/_model_base.py` L18-23 (SqlAlchemyBase, created_at, NaiveDateTime), `mealie/services/household_services/shopping_lists.py` L45-71, 154-220 (can_merge, bulk_create_items)
+  - Related: US-2
+- **FR-013** [FR]: When `HouseholdPreferences.auto_sync_target_shopping_list_id IS NULL`, resolve the target via the household-scoped repo `self.repos.group_shopping_lists` (mealie/repos/repository_factory.py:317-321) using `page_all(PaginationQuery(per_page=1, order_by='created_at', order_direction=OrderDirection.asc))` and select the first item. `created_at` is inherited from `SqlAlchemyBase` (mealie/db/models/_model_base.py:18-23). When zero lists exist for this household, log the i18n warning `auto-sync.no-target-list` (per FR-022) and abort without touching `last_auto_synced_at`. Per NC-002 the chosen ordering is `created_at` ascending.
+  - Code references: `mealie/repos/repository_factory.py` L317-321 (group_shopping_lists, RepositoryShoppingList), `mealie/db/models/_model_base.py` L18-23 (created_at, NaiveDateTime)
+  - Related: US-2
+- **FR-014** [FR]: Target shopping list ownership is enforced at TWO checkpoints: (A) PATCH-time in FR-006 uses `self.repos.group_shopping_lists.get_one(target_id)` against the household-scoped repo (mealie/repos/repository_factory.py:317-321) which silently filters out lists outside `(group_id, household_id)`; a None return raises HTTP 422 with detail `'auto_sync_target_shopping_list_id does not refer to a shopping list owned by this household'`. (B) Sync-time in FR-011 re-runs the same `get_one(target_id)` against the household-scoped repo at task execution time so a list that was deleted or transferred after PATCH cannot leak into another household's sync. Cross-household writes are structurally impossible because `RepositoryShoppingList` carries the `household_id` and applies it as a WHERE clause on every query. See `ShoppingList` (mealie/db/models/household/shopping_list.py:147-181) for the model definition.
+  - Code references: `mealie/repos/repository_factory.py` L317-321 (group_shopping_lists, RepositoryShoppingList, household_id), `mealie/db/models/household/shopping_list.py` L147-181 (ShoppingList, household_id, user_id)
+  - Related: US-6
+- **FR-015** [FR]: Ingredient aggregation pipeline per household: (1) for each `mealplan` in the FR-010 result with a non-null `recipe_id`, fetch the full `Recipe` via `repos.recipes.get_one(mealplan.recipe_id, 'id')`; (2) flatten `recipe.recipe_ingredient` via recursive sub-recipe expansion identical to `get_shopping_list_items_from_recipe` (mealie/services/household_services/shopping_lists.py:323-355) — sub-recipes are expanded by re-feeding `ingredient.referenced_recipe.recipe_ingredient` with scaled `(ingredient.quantity or 1) * scale`; (3) apply the per-household pantry predicate (FR-016) to the fully-flattened list, computing `skipped_pantry_count` as the number of ingredients removed; (4) build one `ShoppingListAddRecipeParamsBulk(recipe_id=mealplan.recipe_id, recipe_increment_quantity=1.0, recipe_ingredients=<filtered list>)` per mealplan and pass the explicit `recipe_ingredients=` argument (NOT None) so `get_shopping_list_items_from_recipe` uses the filtered list rather than refetching the unfiltered recipe ingredients.
+  - Code references: `mealie/services/household_services/shopping_lists.py` L323-411 (get_shopping_list_items_from_recipe, referenced_recipe, sub_recipe)
+  - Related: US-2, US-4
+- **FR-016** [FR]: Pantry filtering is unconditional — there is no preference flag to disable it. The per-household predicate is: load `staple_food_ids = {row.food_id for row in session.execute(select(household_pantry_staples).where(household_pantry_staples.c.household_id == self.household_id)).all()}` ONCE per household per tick; then keep only `ingredient` rows where `ingredient.food is None OR ingredient.food.id not in staple_food_ids`. The filter runs AFTER recursive sub-recipe expansion (FR-015 step 3) so a pantry-staple flour in a sub-recipe is also skipped. Filtered ingredients are passed through `add_recipe_ingredients_to_list` (mealie/services/household_services/shopping_lists.py:413-455) via explicit `recipe_ingredients=` so the existing merge / consolidate / checked-item semantics in `bulk_create_items` (mealie/services/household_services/shopping_lists.py:154-220) are preserved unchanged.
+  - Code references: `mealie/db/models/recipe/ingredient.py` L21-27 (households_to_ingredient_foods, household_id, food_id), `mealie/services/household_services/shopping_lists.py` L154-220, 413-455 (add_recipe_ingredients_to_list, bulk_create_items)
+  - Related: US-4, US-7
+- **FR-017** [FR]: Reuse `ShoppingListService.bulk_create_items` (mealie/services/household_services/shopping_lists.py:154-220) as the canonical merge / consolidate seam. The auto-sync task MUST NOT implement a separate consolidation pass. `bulk_create_items` already (A) consolidates duplicate `ShoppingListItemCreate` entries among the incoming batch via `can_merge` + `merge_items`, (B) merges against existing unchecked rows in the target list (`shopping_list_id=... AND checked=false`), (C) creates only items that did not merge, (D) calls `remove_unused_recipe_references` to keep list-level recipe refs clean. The predecessor name `consolidate_ingredients` referenced by older docs does NOT exist in this codebase — `bulk_create_items` is the canonical entry point and MUST be the only consolidator used.
+  - Code references: `mealie/services/household_services/shopping_lists.py` L154-220 (bulk_create_items, can_merge, merge_items, remove_unused_recipe_references)
+  - Related: US-2, US-3
+- **FR-018** [FR]: Append-only / merge contract preservation: incoming auto-sync items MUST flow through `can_merge` (mealie/services/household_services/shopping_lists.py:45-71) and `merge_items` (mealie/services/household_services/shopping_lists.py:73-128) rather than direct INSERTs. `can_merge` short-circuits on (A) either item `checked=true`, (B) mismatched `food_id`, (C) mismatched `unit_id` with no compatible `UnitConverter.can_convert` path. Auto-sync therefore: (1) NEVER touches checked rows; (2) merges into existing unchecked rows with matching `(food_id, unit_id)`; (3) creates a fresh row only when no merge candidate exists. This contract is the reason the FR-012 multi-replica CAS race is safe — a lost CAS race leaves at most one merged unchecked row, never a duplicate.
+  - Code references: `mealie/services/household_services/shopping_lists.py` L45-128 (can_merge, merge_items)
+  - Related: US-2
+- **FR-019** [FR]: Each shopping list item created or updated by auto-sync MUST carry a `ShoppingListItemRecipeRefCreate(recipe_id=<source recipe>, recipe_quantity=ingredient.quantity, recipe_scale=1.0, recipe_note=ingredient.note or None)` per `get_shopping_list_items_from_recipe` (mealie/services/household_services/shopping_lists.py:370-385) and the list-level `recipe_references` MUST be updated per `add_recipe_ingredients_to_list` (mealie/services/household_services/shopping_lists.py:437-453) so existing UI affordances that group items by source recipe continue to work. `ShoppingListItemRecipeRefCreate` carries only `recipe_id, recipe_quantity, recipe_scale, recipe_note` — no `meal_plan_entry_id` field — and that is the intentional scope for v1 of this feature per META-014.
+  - Code references: `mealie/services/household_services/shopping_lists.py` L323-455 (ShoppingListItemRecipeRefCreate, recipe_id, recipe_quantity)
+  - Related: US-2
+- **FR-020** [FR]: Add the route `POST /api/households/preferences/auto-sync-shopping/run-now` on `HouseholdSelfServiceController` (mealie/routes/households/controller_household_self_service.py:20-62). Guard: `self.checks.can_manage_household()` (mealie/routes/_base/checks.py:23-26). Behavior: invokes the per-household auto-sync pipeline (FR-009 through FR-021) with `force=True` so the FR-009 30-minute window gate and the FR-012 conditional-UPDATE guard are both bypassed. The marker `last_auto_synced_at` IS still written on success (per FR-011 step 6). The route returns HTTP 200 with response body matching the exact shape `{'added_count': int, 'skipped_pantry_count': int, 'target_list_id': UUID4 | None, 'run_at': datetime}` (ISO 8601 UTC). When preconditions fail (no meal plan today, no target list resolvable), respond HTTP 200 with `added_count=0, skipped_pantry_count=0, target_list_id=None, run_at=<now>` AND surface the relevant i18n key from FR-022 in a `detail` field. Permission failure returns HTTP 403 via the guard.
+  - Code references: `mealie/routes/households/controller_household_self_service.py` L20-62 (HouseholdSelfServiceController, can_manage_household), `mealie/routes/_base/checks.py` L23-26 (can_manage_household)
+  - Related: US-3
+- **FR-021** [FR]: Add a new event type `EventTypes.mealplan_auto_synced_to_shopping` to the `EventTypes(Enum)` in mealie/services/event_bus_service/event_types.py:13-60 (the comment in that enum confirms that adding a member requires an alembic migration to the subscriber table — covered by FR-024 which extends the announcement-migration template). Add a new payload class `EventMealPlanAutoSyncedData(EventDocumentDataBase)` in the same file with fields `document_type: EventDocumentType = EventDocumentType.shopping_list, household_id: UUID4, shopping_list_id: UUID4, added_item_count: int, skipped_pantry_count: int`. The payload reuses the existing `EventDocumentDataBase` (mealie/services/event_bus_service/event_types.py:88-91) which provides `operation: EventOperation`. The auto-sync task dispatches via `EventBusService.dispatch(integration_id=DEFAULT_INTEGRATION_ID, group_id=..., household_id=..., event_type=EventTypes.mealplan_auto_synced_to_shopping, document_data=EventMealPlanAutoSyncedData(operation=EventOperation.update, household_id=..., shopping_list_id=..., added_item_count=..., skipped_pantry_count=...))` per the dispatch pattern at mealie/services/event_bus_service/event_bus_service.py:66-96. Exactly one dispatch per successful sync; zero dispatches when steps 4-5 of FR-011 fail or short-circuit.
+  - Code references: `mealie/services/event_bus_service/event_types.py` L13-60, 80-91, 130-132 (EventTypes, EventDocumentDataBase, EventShoppingListData, EventOperation), `mealie/services/event_bus_service/event_bus_service.py` L60-96 (dispatch, _publish_event)
+  - Related: US-5
+- **FR-022** [FR]: Add three i18n keys under a NEW top-level `auto-sync` namespace in mealie/lang/messages/en-US.json (file currently has top-level keys `generic` at line 2 and `mealplan` at line 34). The hyphenated namespace matches existing conventions (`generic.server-error`, `recipe.unique-name-error`). Required keys with their exact English strings: `auto-sync.no-meal-plan-today` = `'No meal plan for today; nothing to sync.'`; `auto-sync.no-target-list` = `'No shopping list is configured or available for auto-sync.'`; `auto-sync.already-synced-today` = `'This household was already auto-synced today.'`. The run-now route (FR-020) surfaces the first two keys in its `detail` field when preconditions fail; the third key surfaces only when a manual run-now with `force=False` would have been blocked (currently unused because FR-020 sets `force=True`, but defined for future use). Mealie ships only the en-US locale so this is the only file that needs to change.
+  - Code references: `mealie/lang/messages/en-US.json` L1-50 (generic, mealplan)
+  - Related: US-9
+- **FR-023** [FR]: All auto-sync queries MUST use household-scoped repos. `repos.meals` (mealie/repos/repository_factory.py:297-301) carries `household_id` and applies it as a WHERE clause in `get_today` (mealie/repos/repository_meals.py:11-21). `repos.household_preferences` (mealie/repos/repository_factory.py:244-253) is also household-scoped. `repos.group_shopping_lists` (mealie/repos/repository_factory.py:317-321) is household-scoped via `household_id=self.household_id`. The task loop MUST build `repos = get_repositories(session, group_id=group.id, household_id=household.id)` per household rather than reusing a single `AllRepositories` instance, so the scope is correct on every iteration. Cross-household reads are structurally prevented.
+  - Code references: `mealie/repos/repository_factory.py` L244-253, 297-301, 317-321 (household_preferences, meals, group_shopping_lists, household_id), `mealie/repos/repository_meals.py` L11-21 (get_today, household_id)
+  - Related: US-6
+- **FR-024** [FR]: Add a single alembic revision file under `mealie/alembic/versions/` modeled on the announcements migration (mealie/alembic/versions/2026-03-27-20.19.07_4395a04f7784_add_announcements.py:1-32 for the upgrade template). The `upgrade()` function MUST: (A) `op.batch_alter_table('household_preferences')` adds four columns (`auto_sync_meal_plan_to_shopping Boolean NOT NULL server_default sa.false()`, `auto_sync_target_shopping_list_id GUID NULL`, `auto_sync_run_time String NOT NULL server_default '00:00'`, `timezone String NULL`, `last_auto_synced_at DateTime NULL`); (B) `op.create_table('household_pantry_staples', ...)` matching the structure of `households_to_ingredient_foods` at mealie/db/models/recipe/ingredient.py:21-27 with a `UniqueConstraint('household_id', 'food_id')`; (C) `op.batch_alter_table('group_event_notifier_options')` adds `mealplan_auto_synced_to_shopping Boolean NOT NULL server_default sa.false()` for the new event subscription column. The `downgrade()` function reverses each step in reverse order modeled on lines 35-47 of the announcement template: drop the new subscription column, drop the new association table, drop the five preference columns.
+  - Code references: `mealie/alembic/versions/2026-03-27-20.19.07_4395a04f7784_add_announcements.py` L1-32 (upgrade, batch_alter_table, show_announcements), `mealie/alembic/versions/2026-03-27-20.19.07_4395a04f7784_add_announcements.py` L35-47 (downgrade, drop_column, batch_alter_table), `mealie/db/models/recipe/ingredient.py` L21-27 (households_to_ingredient_foods, UniqueConstraint)
+  - Related: US-1, US-4
+- **FR-025** [FR]: Add the routes `POST /api/households/self/pantry-staples/{food_id}` and `DELETE /api/households/self/pantry-staples/{food_id}` on `HouseholdSelfServiceController` (mealie/routes/households/controller_household_self_service.py:20-62) modeled on the shape of `IngredientFoodsController` (mealie/routes/unit_and_foods/foods.py:24-78). Guard: `self.checks.can_manage_household()` (mealie/routes/_base/checks.py:23-26). POST validates that `food_id` resolves via `self.repos.ingredient_foods.get_one(food_id)` (returns None if outside the group); on success INSERTs the row `(household_id=self.household_id, food_id=food_id)` into `household_pantry_staples` (FR-002) with `INSERT ... ON CONFLICT DO NOTHING` semantics. DELETE removes that exact row. Both routes return HTTP 204 No Content on success and HTTP 404 if `food_id` does not exist in the group. The route MUST NOT expose any other household's pantry-staple data — only the `self.household_id` row is affected.
+  - Code references: `mealie/routes/unit_and_foods/foods.py` L24-78 (IngredientFoodsController, create_one, delete_one, ingredient_foods), `mealie/routes/households/controller_household_self_service.py` L20-62 (HouseholdSelfServiceController)
+  - Related: US-7
+- **FR-026** [NFR]: [NFR] Test matrix per META-011: (A) unit tests under `tests/unit_tests/services/scheduler/` covering: window-gate boundaries (just-before, on-instant, just-after, end-of-window), CAS UPDATE wins / loses race (mock 0-row response), force=True bypass, empty meal plan (no event, no marker), null timezone fallback to UTC, pantry-filter predicate with empty staple set, pantry-filter with sub-recipe ingredient; (B) integration tests under `tests/integration_tests/user_household_tests/` covering: PATCH partial update roundtrip (only requested fields change), PATCH rejects `last_auto_synced_at`-bearing body with 422, PUT roundtrip with new fields, run-now success with exact response shape per FR-020, run-now 403 for non-admin user, scheduler tick end-to-end exercising `add_recipe_ingredients_to_list` (mealie/services/household_services/shopping_lists.py:413-455) and asserting `bulk_create_items` is invoked exactly once per household per tick.
+  - Code references: `mealie/services/household_services/shopping_lists.py` L154-220, 413-455 (bulk_create_items, add_recipe_ingredients_to_list)
+  - Related: US-2, US-3, US-6
+- **FR-027** [NFR]: [NFR] Multitenant pantry-staple isolation test: create two households A and B in the same group; insert `household_pantry_staples(household_id=A.id, food_id=F.id)`; create identical meal plans referencing a recipe containing food F for both households; trigger the auto-sync task for both households; assert household A's target list does NOT contain food F (skipped) while household B's target list DOES contain food F (because B has no pantry row). Mirror this with the inverse setup (staple in B, not in A) and assert the opposite outcome. This is the FR-002 / META-001 regression guard — if either assertion fails, the implementation has reverted to a group-scoped column or the predicate is not consulting the per-household table.
+  - Code references: `mealie/db/models/recipe/ingredient.py` L21-27 (households_to_ingredient_foods, household_id, food_id), `mealie/db/models/recipe/ingredient.py` L153-192 (IngredientFoodModel)
+  - Related: US-4, US-6, US-7
+
+## Success Criteria
+
+- **SC-001**: A PATCH /api/households/preferences body containing the four new writable fields with valid values and a GET round-trip returns identical JSON, and the response uses the `ReadHouseholdPreferences` schema that includes `last_auto_synced_at`.
+  - Metric: round-trip equality of the four new auto-sync fields after PATCH then GET | Threshold: exact JSON equality on all four writable fields and the Read schema includes last_auto_synced_at
+- **SC-002**: After running the alembic upgrade (FR-024), the `household_preferences` table has exactly five new columns (four writable plus `last_auto_synced_at`) with the correct types and defaults, verifiable via `inspect(engine).get_columns('household_preferences')`.
+  - Metric: number of new columns on household_preferences after alembic upgrade | Threshold: exactly 5 new columns: auto_sync_meal_plan_to_shopping, auto_sync_target_shopping_list_id, auto_sync_run_time, timezone, last_auto_synced_at
+- **SC-003**: After app startup, `SchedulerRegistry._minutely` contains exactly one reference to `auto_sync_meal_plan_to_shopping_lists` (the new task callable), verifiable via `any(cb.__name__ == 'auto_sync_meal_plan_to_shopping_lists' for cb in SchedulerRegistry._minutely)`.
+  - Metric: presence of auto_sync_meal_plan_to_shopping_lists in SchedulerRegistry._minutely | Threshold: exactly one entry with name 'auto_sync_meal_plan_to_shopping_lists'
+- **SC-004**: With auto_sync_run_time='07:30', a tick at 07:00 household-local does NOT execute; a tick at 07:30 DOES execute; a tick at 07:55 DOES execute; a tick at 08:00 does NOT execute. Mocked clock test in FR-026.
+  - Metric: window-gate decisions at four critical clock instants | Threshold: exactly 2 ticks execute (07:30 and 07:55) out of 4 tested boundary clock instants
+- **SC-005**: When HouseholdPreferences.timezone='Asia/Shanghai' and the wall clock reads 16:05 UTC on 2026-06-19, `repos.meals.get_today(tz=ZoneInfo('Asia/Shanghai'))` returns the GroupMealPlan row dated 2026-06-20 (Shanghai local 00:05 next day).
+  - Metric: meal plan date selected by get_today when timezone is Asia/Shanghai at 16:05 UTC | Threshold: exactly date(2026, 6, 20)
+- **SC-006**: Given two households A and B in the same group, running the auto-sync task for household A leaves the SQL row count and content of every ShoppingList belonging to household B unchanged, asserted via byte-equal serialization of B's lists before and after.
+  - Metric: byte equality of household B's shopping list rows before and after household A's sync | Threshold: zero diff bytes between the pre-sync snapshot and the post-sync snapshot for household B
+- **SC-007**: Running the auto-sync task twice in a row for the same household on the same household-local day results in `last_auto_synced_at` being written exactly once and no duplicate shopping list items being created in the second invocation.
+  - Metric: number of writes to last_auto_synced_at and number of new shopping_list_item rows on second invocation | Threshold: exactly 1 marker write across both invocations and 0 new item rows on the second invocation
+- **SC-008**: Given a household with `auto_sync_target_shopping_list_id=NULL` and two shopping lists with `created_at` 2026-01-01 and 2026-02-01, the auto-sync task writes into the list with `created_at=2026-01-01` and not the other.
+  - Metric: id of the shopping list written to when target is null | Threshold: exactly the list with the smaller created_at value
+- **SC-009**: Given a recipe whose ingredient list contains a sub-recipe reference, the auto-sync task includes ingredients from the sub-recipe in the items merged into the target list, asserted by comparing the items_to_create length against the fully-flattened expected count.
+  - Metric: number of items_to_create produced by FR-015 pipeline when input has a sub-recipe | Threshold: equals the count of leaf ingredients across the recipe and its sub-recipe with scaled quantities
+- **SC-010**: Given the target list already contains an unchecked row `(food_id=F, unit_id=U, quantity=2.0)` and the auto-sync produces `(food_id=F, unit_id=U, quantity=3.0)`, after the sync the list contains exactly one unchecked row with quantity 5.0 and no new row was created for food F + unit U.
+  - Metric: row count and merged quantity of (F, U) entries in target list after sync | Threshold: exactly 1 row with quantity 5.0 and 0 new row inserts for food_id=F unit_id=U
+- **SC-011**: Every shopping_list_item row created or updated by auto-sync has a non-empty `recipe_references` array whose first element has `recipe_id` equal to the source GroupMealPlan.recipe_id.
+  - Metric: presence and recipe_id of recipe_references[0] on items written by auto-sync | Threshold: 100 percent of created/updated rows have len(recipe_references) >= 1 and recipe_references[0].recipe_id matches the source mealplan recipe_id
+- **SC-012**: A POST to /api/households/preferences/auto-sync-shopping/run-now by a can_manage_household=true user returns HTTP 200 with a JSON body whose keys are exactly the set {'added_count', 'skipped_pantry_count', 'target_list_id', 'run_at'} and whose values have the types int, int, UUID or null, ISO-8601 datetime string.
+  - Metric: exact JSON key set and value-type validation of the run-now response body | Threshold: key set equals {'added_count','skipped_pantry_count','target_list_id','run_at'} and value types match int/int/UUID-or-null/ISO-8601 string
+- **SC-013**: A successful auto-sync run dispatches `EventBusService.dispatch` exactly once with `event_type=EventTypes.mealplan_auto_synced_to_shopping` and `document_data` of type `EventMealPlanAutoSyncedData` carrying household_id, shopping_list_id, added_item_count, skipped_pantry_count, and operation.
+  - Metric: number of EventBusService.dispatch invocations and payload field presence | Threshold: exactly 1 dispatch with event_type=EventTypes.mealplan_auto_synced_to_shopping and payload includes all 5 required fields
+- **SC-014**: Given `household_pantry_staples(household_id=H.id, food_id=F.id)` and a meal plan recipe that contains food F, after the auto-sync runs for household H the target list contains zero rows whose `food_id=F.id`.
+  - Metric: count of shopping_list_item rows with food_id=F in target list after sync | Threshold: exactly 0 rows
+- **SC-015**: Given two households A and B in the same group with identical meal plans referencing food F, and `household_pantry_staples` contains only `(A.id, F.id)`: after auto-sync runs for both, household A's target list has 0 rows with food_id=F and household B's target list has at least 1 row with food_id=F.
+  - Metric: parallel row counts of food_id=F in household A's and household B's target lists | Threshold: A has exactly 0 rows with food_id=F and B has at least 1 row with food_id=F
+- **SC-016**: A PATCH /api/households/preferences with `auto_sync_target_shopping_list_id=<id of a list owned by a different household in the same group>` returns HTTP 422 and the household_preferences row is unchanged on disk.
+  - Metric: HTTP status and pre/post equality of household_preferences row when cross-household list id is PATCHed | Threshold: status code is exactly 422 and the row's JSON is byte-equal before and after the request
+- **SC-017**: When `repos.meals.get_today(...)` returns an empty list for a household, after the task iteration `last_auto_synced_at` for that household is unchanged from its prior value (null or whatever it was).
+  - Metric: pre/post equality of last_auto_synced_at for a household with no meal plan today | Threshold: last_auto_synced_at is byte-equal before and after the task iteration
+- **SC-018**: A PATCH /api/households/preferences body that contains `last_auto_synced_at` is rejected with HTTP 422 by `HouseholdPreferencesPartialUpdate` (since the field is not declared on the schema, pydantic raises `extra forbidden` when `model_config = ConfigDict(extra='forbid')` is set on `MealieModel`).
+  - Metric: HTTP status when client PATCHes with last_auto_synced_at in body | Threshold: exactly HTTP 422
+- **SC-019**: The file `mealie/lang/messages/en-US.json` contains exactly three new keys under the top-level `auto-sync` namespace: `no-meal-plan-today`, `no-target-list`, `already-synced-today`, each mapped to a non-empty English string.
+  - Metric: set of keys present under en-US.json auto-sync namespace | Threshold: set equals {'no-meal-plan-today','no-target-list','already-synced-today'} and every value is a non-empty string
+- **SC-020**: Running `alembic upgrade head` followed by `alembic downgrade -1` on a fresh database leaves the schema bit-equal to the pre-upgrade state, asserted by comparing `inspect(engine).get_table_names()` and per-table `get_columns(...)` snapshots.
+  - Metric: table list and per-table column list before upgrade vs. after upgrade-then-downgrade | Threshold: set equality of get_table_names and equality of get_columns for every table
+- **SC-021**: A POST to /api/households/self/pantry-staples/{food_id} by a user with `can_manage_household=False` returns HTTP 403 and inserts zero rows into `household_pantry_staples`.
+  - Metric: HTTP status and row count delta in household_pantry_staples after non-admin POST | Threshold: status code exactly 403 and inserted row count exactly 0
+- **SC-022**: After CI runs the new test suite for the auto-sync feature, the test summary reports every test in the FR-026 matrix as a PASS (no skips, no xfails, no errors).
+  - Metric: count of FR-026 tests with outcome PASS in CI | Threshold: equals the total count of FR-026 tests (no skips, no xfails, no failures)
+- **SC-023**: A POST run-now invocation with `last_auto_synced_at` already set to `datetime.now(UTC)` succeeds (HTTP 200) and the target list receives the expected items (added_count > 0 when the recipe has non-pantry ingredients).
+  - Metric: HTTP status and added_count of run-now when marker is already set to today | Threshold: status code exactly 200 and added_count strictly greater than 0 for a recipe with at least one non-pantry ingredient
+- **SC-024**: Asserting that `MINUTES_5 == 5` and `run_minutely` is decorated with `@repeat_every(minutes=MINUTES_5, ...)` in `mealie/services/scheduler/scheduler_service.py`.
+  - Metric: value of MINUTES_5 constant and decorator arg of run_minutely | Threshold: MINUTES_5 equals 5 and run_minutely decorator has minutes=MINUTES_5
+- **SC-025**: When `repos.meals.get_today(...)` returns `[]` for a household, no `EventBusService.dispatch` call is made for that household in that tick.
+  - Metric: EventBusService.dispatch call count for a household with empty get_today result | Threshold: exactly 0 dispatch calls
+
+## Key Entities
+
+- **HouseholdPreferencesModel**: Per-household preferences row. Extended in FR-001 with five fields: auto_sync_meal_plan_to_shopping (bool NOT NULL), auto_sync_target_shopping_list_id (GUID nullable FK shopping_lists.id), auto_sync_run_time (str NOT NULL HH:MM), timezone (str nullable IANA), last_auto_synced_at (datetime nullable, server-owned).
+  - Fields: id: GUID, household_id: GUID FK households.id, auto_sync_meal_plan_to_shopping: bool NOT NULL DEFAULT false, auto_sync_target_shopping_list_id: GUID NULL FK shopping_lists.id ON DELETE SET NULL, auto_sync_run_time: str NOT NULL DEFAULT '00:00', timezone: str NULL, last_auto_synced_at: datetime NULL (NaiveDateTime)
+  - References: Household, ShoppingList
+- **household_pantry_staples**: New association table parallel to households_to_ingredient_foods. The row (household_id, food_id) IS the pantry-staple flag for that food in that household. Per FR-002 and NC-001 this replaces the literal column-on-foods interpretation so pantry-staple flags do not leak across households in the same group.
+  - Fields: household_id: GUID FK households.id ON DELETE CASCADE, food_id: GUID FK ingredient_foods.id ON DELETE CASCADE, UNIQUE (household_id, food_id) constraint
+  - References: Household, IngredientFoodModel
+- **UpdateHouseholdPreferences**: Pydantic schema for full-replacement PUT body. Extended in FR-003 with the four writable auto-sync fields. Does NOT include last_auto_synced_at per NC-003.
+  - Fields: auto_sync_meal_plan_to_shopping: bool = False, auto_sync_target_shopping_list_id: UUID4 | None = None, auto_sync_run_time: str = '00:00', timezone: str | None = None
+  - References: HouseholdPreferencesModel
+- **HouseholdPreferencesPartialUpdate**: Pydantic schema for PATCH partial-update body per FR-004. Every field is Optional[...] = None; the route applies the diff via model_dump(exclude_unset=True). Does NOT include last_auto_synced_at.
+  - Fields: All existing UpdateHouseholdPreferences fields as Optional[...] = None, auto_sync_meal_plan_to_shopping: bool | None = None, auto_sync_target_shopping_list_id: UUID4 | None = None, auto_sync_run_time: str | None = None, timezone: str | None = None
+  - References: UpdateHouseholdPreferences
+- **ReadHouseholdPreferences**: Diagnostics-facing read schema per FR-005. Includes last_auto_synced_at so operators can see the marker, while the PATCH/PUT input schemas exclude it.
+  - Fields: All UpdateHouseholdPreferences fields, id: UUID4, last_auto_synced_at: datetime | None (server-owned)
+  - References: UpdateHouseholdPreferences, HouseholdPreferencesModel
+- **EventMealPlanAutoSyncedData**: New EventDocumentDataBase subclass per FR-021 carrying the post-sync payload. No PII (no user names, recipe names, or ingredient details) — only ids and counts so webhook subscribers can fan out without leaking household data.
+  - Fields: document_type: EventDocumentType = EventDocumentType.shopping_list, operation: EventOperation, household_id: UUID4, shopping_list_id: UUID4, added_item_count: int, skipped_pantry_count: int
+  - References: EventDocumentDataBase, EventTypes
+- **ShoppingListService**: Existing merge/consolidation service. The auto-sync task is layered on top via `add_recipe_ingredients_to_list` (line 413) which delegates to `bulk_create_items` (line 154) for the canonical consolidator behavior.
+  - Fields: bulk_create_items: canonical consolidator (FR-017), can_merge / merge_items: merge contract (FR-018), get_shopping_list_items_from_recipe: recursive expansion (FR-015), add_recipe_ingredients_to_list: entrypoint with recipe-reference updates (FR-019)
+  - References: ShoppingList, RepositoryShoppingList
+
+## Edge Cases
+
+- Household has auto_sync_meal_plan_to_shopping=true but no meal plan exists for today → FR-011 step 2: skip the household, log the i18n warning auto-sync.no-meal-plan-today, and DO NOT bump last_auto_synced_at so a meal plan added later in the same day will trigger a real sync once the next scheduler tick falls inside the FR-009 window.
+- Household has auto_sync_target_shopping_list_id pointing to a deleted (soft-deleted or hard-deleted) list → FR-014 sync-time check returns None from `repos.group_shopping_lists.get_one(target_id)`; the task logs auto-sync.no-target-list and aborts without touching last_auto_synced_at or dispatching an event.
+- Two replicas tick the same household in the same 5-minute bucket → Both replicas execute steps 1-5 of FR-011, but the FR-012 conditional UPDATE on last_auto_synced_at returns 0 affected rows for the loser. The duplicate bulk_create_items invocation merges into the unchecked row written by the winner per FR-018 (no duplicate row) and the loser's event dispatch is a no-op duplicate that subscribers MUST be ready for (an event-bus subscriber dedup based on the marker timestamp is a downstream concern, not in scope for v1).
+- Household timezone is set to an invalid IANA string after a manual DB edit → FR-009 calls `ZoneInfo(value)` which raises `ZoneInfoNotFoundError`; the task catches the exception per-household, logs an error with the household id, and continues to the next household rather than crashing the entire tick. last_auto_synced_at is NOT touched for the failing household.
+- Recipe contains a sub-recipe reference cycle (recipe A includes recipe B includes recipe A) → The existing `get_shopping_list_items_from_recipe` (mealie/services/household_services/shopping_lists.py:323-355) does not guard against cycles, and Mealie's data model assumes acyclic recipe references. The auto-sync task wraps the recursive expansion in a `try/except RecursionError` and on failure logs an error with the recipe id, aborts the household for this tick, and does NOT touch last_auto_synced_at.
+- auto_sync_run_time is changed mid-day from '07:30' to '14:00' → The FR-009 gate uses the current value at every tick, so the previously-armed 07:30 window is no longer reachable for the rest of the day; the new 14:00 window will fire next. If 14:00 has already passed in household-local time, no auto-sync runs for the rest of the day. The household administrator can use run-now (FR-020) to trigger an immediate sync.
+- Pantry-staple food F is deleted from the group via IngredientFoodsController.delete_one → The CASCADE on `household_pantry_staples.food_id` (FR-002) automatically removes every household's staple row for that food. No application-level cleanup is needed and subsequent auto-sync runs include the food (since the predicate row is gone).
+- Household has zero shopping lists and auto_sync_target_shopping_list_id is NULL → FR-013 page_all returns an empty page; the task logs auto-sync.no-target-list, does NOT touch last_auto_synced_at, and continues to the next household.
+- POST run-now invoked when the household is in a different group than the user (auth bypass attempt) → The `BaseUserController` binds `self.household_id` and `self.group_id` to the authenticated user's session, so the auto-sync invocation always operates on the calling user's own household. A user cannot specify a different household_id via the route — there is no path parameter for it on the run-now endpoint.
+
+## Assumptions
+
+- The Mealie deployment runs Python 3.11+ so `zoneinfo.ZoneInfo` is available without the `tzdata` backport. The Dockerfile already pins 3.11+ per the repo README.
+- The scheduler clock and the database clock are synchronized within a few seconds; the FR-009 30-minute window is wide enough to tolerate up to ~5 minutes of clock skew.
+- Mealie ships with only the en-US locale (one JSON file at mealie/lang/messages/en-US.json). The i18n keys in FR-022 are added only to that file; no other locale files exist to maintain.
+- The existing `EventBusService.dispatch` (mealie/services/event_bus_service/event_bus_service.py:66-96) is the canonical entry point for all event-bus integrations. Subscribers (Apprise, webhooks) are registered via `_get_listeners` and require no changes for the new event type beyond the subscription column added in FR-024.
+- A household administrator (can_manage_household=true) has the right to write to any shopping list owned by their household. There is no per-shopping-list ACL inside a household — household membership IS the access boundary.
+- Hard deletes of shopping lists set `auto_sync_target_shopping_list_id` to NULL via the `ON DELETE SET NULL` foreign key constraint declared in FR-001 / FR-024.
+- The PATCH-time and sync-time ownership validation in FR-014 use the same `household_id`-scoped repo, so the validation rule is consistent regardless of which path the value travels.
+- `bulk_create_items` (mealie/services/household_services/shopping_lists.py:154-220) is and remains the canonical consolidator. The function `consolidate_ingredients` mentioned in some older PR discussions does not exist in this codebase; the auto-sync task MUST NOT introduce one.
+
+## Out of Scope
+
+- Multi-day meal plan windows. Only today's meal plan is synced; lookahead is a future feature.
+- Per-day pantry filtering (e.g. 'this food is a staple on weekdays only'). The pantry membership is a single boolean per (household, food).
+- Conflict-resolution UI for the case where the user has manually edited the auto-synced items between two consecutive ticks. The merge contract in FR-018 is the only resolution path.
+- Internationalization for non-en-US locales. Mealie currently ships only en-US.json.
+- A dashboard / analytics page summarizing past auto-sync runs. The `last_auto_synced_at` marker is the only history surface in v1; richer audit logs are a future feature.
+- Re-synthesizing the meal-plan-entry id into ShoppingListItemRecipeRefCreate. The current schema carries only recipe_id, recipe_quantity, recipe_scale, recipe_note per FR-019 / META-014.
+- Subscriber-side dedup for the duplicate event dispatch in the rare two-replica race case in the edge-case section. Subscribers MUST tolerate at-least-once delivery (existing event-bus contract).
+
+## Self-Concerns (writer self-reflection)
+
+- **FR-009**: The FR-009 implementation calls `ZoneInfo(value)` once per household per tick rather than caching the validation result. For deployments with thousands of households, the repeated ZoneInfo lookups during a single tick could add measurable overhead even though each lookup is cheap (microseconds).
+  - Evidence gap: We have no production-traffic profile against which to measure the ZoneInfo lookup cost. The fallback resolution path is to cache per-tick using a `{timezone_str: ZoneInfo}` dict scoped to the tick if profiling shows the lookup dominates. The recommended default is to implement the simple per-household lookup first and add the cache only if profiling demonstrates a regression.
+  - Suggested resolution: Implement the per-household direct lookup in v1. Add a tick-scoped ZoneInfo cache in a follow-up PR only if a microbenchmark or production profile shows the lookup cost exceeds 1 percent of the tick wall time.
+- **FR-021**: The new `EventTypes.mealplan_auto_synced_to_shopping` member requires a corresponding column on the event-bus subscriber options table (the comment on the EventTypes enum at mealie/services/event_bus_service/event_types.py:13-22 spells this out). FR-024 includes the migration, but if a deployment runs the new code against an old database schema (no migration), the dispatch will silently fail when subscribers query their subscription options column.
+  - Evidence gap: We have not exercised the path where the new code runs against a pre-migration database. The recommended default is to fail loudly at startup by reading the column once and raising a clear error if it is absent, rather than failing silently at dispatch time. A reviewer may prefer a softer warning-and-skip behavior; defer to reviewer decision.
+  - Suggested resolution: At app startup, verify the presence of the `mealplan_auto_synced_to_shopping` column on the subscriber table via SQLAlchemy reflection. If absent, log a critical error and raise a startup exception so the operator runs the migration before serving traffic.
+- **FR-022**: The i18n keys `auto-sync.no-meal-plan-today`, `auto-sync.no-target-list`, and `auto-sync.already-synced-today` are added only to `mealie/lang/messages/en-US.json`. If Mealie ever onboards a second locale, those keys will need to be back-filled in every other locale file; today no other locale files exist.
+  - Evidence gap: We confirmed via repository inspection that only en-US.json is present. If a future locale is added, the back-fill is a mechanical translation task and not a feature regression. The recommended default is to document this assumption (Assumption #3) and accept the en-US-only baseline.
+  - Suggested resolution: Accept the en-US-only baseline. Add a backlog ticket linked to this feature so when a second locale is introduced, the three new keys are back-filled in the same PR.
+
+---
+
+_Generated by DevLoop spec phase — writer=claude-sonnet-4.5, reviewer=meta:claude-opus-4.7, iterations=2_

@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "primary": "Add upload-image-to-recipe endpoint using OpenAI Vision; must handle security: rate-limit, magic-byte MIME check, prompt injection mitigation, no LLM response in logs",
+  "intent_type": "add_feature",
+  "scope": ["backend", "api", "external_integration", "security", "test"],
+  "confidence": 0.9,
+  "hypotheses": [
+    {
+      "id": "H1",
+      "summary": "User wants a single-image POST /api/recipes/create/image endpoint that calls OpenAI Vision and persists the returned Recipe, with the 10-item security checklist enforced (size cap, real-MIME sniff, UUID temp file, per-user/hour rate-limit, 60s timeout, prompt-injection guard, immediate temp-file cleanup, no raw-LLM leakage to client OR logs).",
+      "indicators": ["upload", "OpenAI", "image", "vision", "rate-limit", "MIME", "prompt injection", "no LLM response in logs"],
+      "counter_indicators": [],
+      "verdict": "primary"
+    }
+  ],
+  "skeptic_challenges": [],
+  "verifications": [],
+  "excluded": [],
+  "pending_clarification": [],
+  "rounds_used": 1
+}

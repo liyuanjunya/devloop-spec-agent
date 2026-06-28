@@ -1,0 +1,69 @@
+{
+  "schema_version": "1.0",
+  "metadata": {
+    "feature_id": "GAP-C2-live-20260620",
+    "title": "C2 live activation synthetic spec",
+    "writer_model": "synthetic",
+    "reviewer_model": "synthetic",
+    "iterations": 0,
+    "needs_review": false,
+    "total_llm_calls": 0,
+    "total_tool_calls": 0
+  },
+  "summary": "Synthetic spec used to drive a live activation of the test-grounded executability validator (C2). Three user stories each name a distinct test path; one points at a healthy stub, one at a broken-import stub, one at a stub whose function name does not match the spec.",
+  "needs_clarification": [],
+  "user_stories": [
+    {
+      "id": "US-1",
+      "priority": "P1",
+      "title": "Baseline collectable test",
+      "description": "Story whose independent test is a healthy pytest stub that should collect cleanly.",
+      "why_this_priority": "Anchors the negative case for the validator: a passing reference must not produce a problem.",
+      "independent_test": "`tests/test_gap_c2_ok.py::test_baseline`",
+      "acceptance": [
+        {
+          "given": "the stub file tests/test_gap_c2_ok.py exists",
+          "when": "pytest --collect-only runs",
+          "then": "the node id tests/test_gap_c2_ok.py::test_baseline is collected"
+        }
+      ]
+    },
+    {
+      "id": "US-2",
+      "priority": "P1",
+      "title": "Broken-import test",
+      "description": "Story whose independent test imports a module that does not exist.",
+      "why_this_priority": "Forces C2 to surface an import_error so the rewriter can fix the spec or the test.",
+      "independent_test": "`tests/test_gap_c2_brokenimport.py::test_x`",
+      "acceptance": [
+        {
+          "given": "the stub file tests/test_gap_c2_brokenimport.py imports a nonexistent module",
+          "when": "pytest --collect-only runs",
+          "then": "C2 surfaces a TestExecutabilityProblem with kind=import_error"
+        }
+      ]
+    },
+    {
+      "id": "US-3",
+      "priority": "P1",
+      "title": "Wrong-function-name test",
+      "description": "Story whose independent test names a function that is not defined in the stub file.",
+      "why_this_priority": "Forces C2 to detect a function-level miss against an otherwise collectable file.",
+      "independent_test": "`tests/test_gap_c2_nofunc.py::test_missing`",
+      "acceptance": [
+        {
+          "given": "the stub file tests/test_gap_c2_nofunc.py defines test_present but not test_missing",
+          "when": "pytest --collect-only runs",
+          "then": "C2 surfaces a TestExecutabilityProblem for tests/test_gap_c2_nofunc.py::test_missing"
+        }
+      ]
+    }
+  ],
+  "functional_requirements": [],
+  "success_criteria": [],
+  "key_entities": [],
+  "edge_cases": [],
+  "assumptions": [],
+  "out_of_scope": [],
+  "self_concerns": []
+}

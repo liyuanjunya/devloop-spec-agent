@@ -1,0 +1,1057 @@
+{
+  "schema_version": "1.0",
+  "metadata": {
+    "feature_id": "recipe-favorites-self-api",
+    "title": "Recipe Favorites — Self-Service API",
+    "writer_model": "copilot-cli-spec-rewriter",
+    "iterations": 2,
+    "needs_review": true
+  },
+  "summary": "Add self-service favorite APIs and recipe favorite metadata while resolving v1 review blockers. Recommended defaults reuse Mealie's existing `users_to_recipes` / `UserToRecipe.is_favorite` storage, make `GET /api/users/self/favorites` a paginated recipe-summary list, move the old self favorites rating-summary contract to a ratings-namespaced route, add a user-services layer, enforce i18n 404s, hydrate authenticated and public recipe reads without N+1, and harden `users_to_recipes` cleanup with both user-delete code and FK cascade migration work.",
+  "needs_clarification": [
+    {
+      "id": "NC-001",
+      "decision": "Data model: new `user_favorite_recipe` table vs reuse `users_to_recipes` / `UserToRecipe.is_favorite`",
+      "recommended_default": "reuse `UserToRecipe.is_favorite` because current code and the 2024 migration already consolidated favorites there; do not add `user_favorite_recipe` unless a reviewer explicitly rejects reuse before coding.",
+      "impact_if_rejected": "implement a new table with `user_id`/`recipe_id` FKs, `created_at`, unique `(user_id, recipe_id)`, `user_id` index, backfill from existing `is_favorite` rows, and compatibility reads/writes."
+    },
+    {
+      "id": "NC-002",
+      "decision": "Route compatibility: keep old `GET /api/users/self/favorites` rating summaries vs migrate it to a ratings-namespaced route",
+      "recommended_default": "make `/api/users/self/favorites` the requested paginated recipe-summary list and move old rating-summary behavior to `/api/users/self/ratings/favorites` (or equivalent). The verified blast radius is the backend parametrized ratings test plus route constants, not a frontend UI path.",
+      "impact_if_rejected": "use a new recipe-list path and update US-3/FR-004/SC-003 consistently before coding; do not leave dual meanings on the same route."
+    }
+  ],
+  "user_stories": [
+    {
+      "id": "US-1",
+      "priority": "P1",
+      "title": "Authenticated user favorites a recipe",
+      "description": "As a signed-in user, I can favorite a recipe visible to my group without knowing or sending my own user id.  ",
+      "independent_test": "Log in, POST `/api/users/self/favorites/{recipe_slug}` twice, and verify exactly one canonical favorite row/state exists.  ",
+      "acceptance": [
+        {
+          "given": "an authenticated user and a visible recipe",
+          "when": "they POST `/api/users/self/favorites/{recipe_slug}`",
+          "then": "the service sets canonical favorite state to true for that user and recipe"
+        },
+        {
+          "given": "the favorite already exists",
+          "when": "they POST the same route again sequentially",
+          "then": "the response is successful and no duplicate association row is created"
+        },
+        {
+          "given": "a recipe outside the user's group visibility",
+          "when": "they POST the self favorite route",
+          "then": "the API returns an i18n-backed 404"
+        }
+      ]
+    },
+    {
+      "id": "US-2",
+      "priority": "P1",
+      "title": "Authenticated user unfavorites a recipe",
+      "description": "As a signed-in user, I can remove a favorite using a self route.  ",
+      "independent_test": "Favorite a recipe, DELETE `/api/users/self/favorites/{recipe_slug}` twice, then verify the canonical favorite state is false and no error is returned.  ",
+      "acceptance": [
+        {
+          "given": "an authenticated user with a favorite",
+          "when": "they DELETE `/api/users/self/favorites/{recipe_slug}`",
+          "then": "the service sets `is_favorite=false` without deleting or corrupting an existing rating"
+        },
+        {
+          "given": "no favorite exists",
+          "when": "they DELETE the same route",
+          "then": "the response is still successful"
+        },
+        {
+          "given": "a recipe outside the user's group visibility",
+          "when": "they DELETE the self favorite route",
+          "then": "the API returns an i18n-backed 404"
+        }
+      ]
+    },
+    {
+      "id": "US-3",
+      "priority": "P1",
+      "title": "User lists their favorites as recipes (paginated)",
+      "description": "As a signed-in user, I can list my favorited recipes with Mealie pagination semantics.  ",
+      "independent_test": "Favorite multiple recipes and GET `/api/users/self/favorites?page=1&perPage=50`; verify a `PaginationBase[RecipeSummary]` body containing only current-user visible favorites.  ",
+      "acceptance": [
+        {
+          "given": "an authenticated user with favorites",
+          "when": "they GET `/api/users/self/favorites`",
+          "then": "the API returns a paginated recipe-summary collection, not rating summaries"
+        },
+        {
+          "given": "pagination query parameters",
+          "when": "the user requests a page",
+          "then": "`page`, `perPage`, `total`, `totalPages`, `next`, `previous`, and `items` follow `PaginationQuery` / `PaginationBase` conventions"
+        },
+        {
+          "given": "other users have favorites",
+          "when": "the current user lists favorites",
+          "then": "those recipes are not included unless also favorited by the current user and visible in the current group"
+        },
+        {
+          "given": "the old `/api/users/self/favorites` rating-summary route exists",
+          "when": "this feature is implemented",
+          "then": "that old rating-summary contract is renamed to a ratings-namespaced route and the backend test caller is updated"
+        }
+      ]
+    },
+    {
+      "id": "US-4",
+      "priority": "P1",
+      "title": "Recipe list/detail shows `favorited` and `favorite_count`",
+      "description": "As any recipe reader, I can see how many users favorited each returned recipe; authenticated users also see whether they favorited it.  ",
+      "independent_test": "Favorite a recipe as user A, fetch authenticated recipe list/detail as user A and user B, then fetch public explore list/detail anonymously; compare `favorited` and `favorite_count`.  ",
+      "acceptance": [
+        {
+          "given": "an authenticated user who favorited a recipe",
+          "when": "they GET `/api/recipes` or `/api/recipes/{slug}`",
+          "then": "the recipe has `favorited=true` and `favorite_count>=1`"
+        },
+        {
+          "given": "an authenticated user who did not favorite the recipe",
+          "when": "they fetch the same recipe",
+          "then": "`favorited=false` and `favorite_count` remains the real count"
+        },
+        {
+          "given": "an unauthenticated request to `/api/explore/groups/{group_slug}/recipes` or `/api/explore/groups/{group_slug}/recipes/{recipe_slug}`",
+          "when": "a public recipe is returned",
+          "then": "`favorited=false` and `favorite_count` is the real count, not forced to 0"
+        },
+        {
+          "given": "a recipe list with many items",
+          "when": "favorites are hydrated",
+          "then": "the implementation uses a SELECT/loader-compatible or batched aggregate strategy rather than one query per recipe"
+        }
+      ]
+    },
+    {
+      "id": "US-5",
+      "priority": "P2",
+      "title": "Existing favorite endpoints stay operational",
+      "description": "Existing user-id favorite routes continue to work while self routes are introduced.  ",
+      "independent_test": "Exercise both `/api/users/{id}/favorites/{slug}` and `/api/users/self/favorites/{recipe_slug}` for the same user and verify they affect the same canonical favorite state.  ",
+      "acceptance": [
+        {
+          "given": "an existing client using `/api/users/{id}/favorites/{slug}`",
+          "when": "it adds or removes a favorite for the current user",
+          "then": "behavior is unchanged"
+        },
+        {
+          "given": "a client attempts to mutate another user's favorites through the user-id route",
+          "when": "the ids differ",
+          "then": "existing permission checks still reject it"
+        },
+        {
+          "given": "self routes are used",
+          "when": "they mutate favorites",
+          "then": "they call the same service/repository/storage path as legacy routes"
+        }
+      ]
+    },
+    {
+      "id": "US-6",
+      "priority": "P1",
+      "title": "Favorite data is cleaned with users and recipes",
+      "description": "As an operator, I should not have orphan favorite rows after recipe or user deletion.  ",
+      "independent_test": "Favorite a recipe, delete the recipe, assert rows/counts are clean; repeat by deleting a user with favorites.  ",
+      "acceptance": [
+        {
+          "given": "a favorited recipe is deleted",
+          "when": "`RepositoryRecipes._delete_recipe` runs",
+          "then": "`UserToRecipe` rows for that recipe are removed and counts/lists ignore the deleted recipe"
+        },
+        {
+          "given": "a user with favorites is deleted",
+          "when": "`RepositoryUsers.delete` runs",
+          "then": "`UserToRecipe` rows for that user are removed before deleting the user"
+        },
+        {
+          "given": "database FK constraints are updated",
+          "when": "a parent user or recipe row is deleted by supported DB paths",
+          "then": "`users_to_recipes` rows are removed by `ON DELETE CASCADE` or an equivalent migration-supported constraint"
+        }
+      ]
+    }
+  ],
+  "functional_requirements": [
+    {
+      "id": "FR-001",
+      "text": "Stage-0 data-model decision MUST be recorded before coding. Recommended default: reuse existing `users_to_recipes` / `UserToRecipe.is_favorite` as canonical favorite storage and do not add `user_favorite_recipe`. If reviewers reject reuse, create the requested table and include backfill/dual-read compatibility from `UserToRecipe.is_favorite`.",
+      "requirement_type": "functional",
+      "code_references": [
+        {
+          "path": "mealie/db/models/users/user_to_recipe.py",
+          "symbols": [
+            "UserToRecipe",
+            "is_favorite",
+            "UniqueConstraint",
+            "user_id` index",
+            "recipe_id` index"
+          ],
+          "line_ranges": [
+            [
+              17,
+              30
+            ]
+          ]
+        },
+        {
+          "path": "mealie/alembic/versions/2024-03-18-02.28.15_d7c6efd2de42_migrate_favorites_and_ratings_to_user_.py",
+          "symbols": [
+            "migration creates `users_to_recipes",
+            "drops `users_to_favorites"
+          ],
+          "line_ranges": [
+            [
+              153,
+              194
+            ]
+          ]
+        }
+      ],
+      "related": [
+        "US-1",
+        "US-2",
+        "US-6"
+      ]
+    },
+    {
+      "id": "FR-002",
+      "text": "Favorite business logic MUST live behind a service in `mealie/services/user_services/` (for example `user_favorites_service.py`) instead of adding new cross-cutting logic directly in route handlers. The service MUST coordinate group-scoped recipe lookup, idempotent favorite writes, favorite list pagination, and cleanup calls through repositories. A deliberately thin pass-through service is acceptable only if explicitly named and tested.",
+      "requirement_type": "functional",
+      "code_references": [
+        {
+          "path": "mealie/services/user_services/user_service.py",
+          "symbols": [
+            "existing `UserService` pattern"
+          ],
+          "line_ranges": [
+            [
+              8,
+              14
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/users/ratings.py",
+          "symbols": [
+            "current route-direct favorite pattern to wrap/delegate"
+          ],
+          "line_ranges": [
+            [
+              17,
+              23
+            ],
+            [
+              54,
+              86
+            ]
+          ]
+        },
+        {
+          "path": "mealie/repos/repository_factory.py",
+          "symbols": [
+            "users` and `user_ratings` repositories"
+          ],
+          "line_ranges": [
+            [
+              183,
+              188
+            ]
+          ]
+        }
+      ],
+      "related": [
+        "US-1",
+        "US-2",
+        "US-3"
+      ]
+    },
+    {
+      "id": "FR-003",
+      "text": "Add Pydantic schemas for the self favorites API in `mealie/schema/user/user_favorites.py`. The GET recipe-list contract MUST be a paginated `RecipeSummary` response using existing `PaginationQuery` / `PaginationBase` field names; generated schema exports and TypeScript types MUST be regenerated rather than manually edited.",
+      "requirement_type": "functional",
+      "code_references": [
+        {
+          "path": "mealie/schema/response/pagination.py",
+          "symbols": [
+            "PaginationQuery",
+            "PaginationBase"
+          ],
+          "line_ranges": [
+            [
+              46,
+              58
+            ]
+          ]
+        },
+        {
+          "path": "mealie/schema/recipe/recipe.py",
+          "symbols": [
+            "RecipeSummary",
+            "loader options",
+            "Recipe"
+          ],
+          "line_ranges": [
+            [
+              116,
+              149
+            ],
+            [
+              168,
+              175
+            ],
+            [
+              182,
+              190
+            ]
+          ]
+        }
+      ],
+      "related": [
+        "US-3"
+      ]
+    },
+    {
+      "id": "FR-004",
+      "text": "Implement authenticated self endpoints: `POST /api/users/self/favorites/{recipe_slug}`, `DELETE /api/users/self/favorites/{recipe_slug}`, and `GET /api/users/self/favorites?page=...` returning `PaginationBase[RecipeSummary]`. Resolve the existing rating-summary collision by moving old `GET /api/users/self/favorites` rating summaries to `/api/users/self/ratings/favorites` (or equivalent ratings-namespaced path) and updating the single backend parametrized test caller; do not keep `/self/favorites` as a rating-summary alias.",
+      "requirement_type": "functional",
+      "code_references": [
+        {
+          "path": "mealie/routes/users/crud.py",
+          "symbols": [
+            "current self ratings/favorites routes"
+          ],
+          "line_ranges": [
+            [
+              23,
+              40
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/users/ratings.py",
+          "symbols": [
+            "legacy add/remove favorites"
+          ],
+          "line_ranges": [
+            [
+              78,
+              86
+            ]
+          ]
+        },
+        {
+          "path": "tests/integration_tests/user_recipe_tests/test_recipe_ratings.py",
+          "symbols": [
+            "self route test caller"
+          ],
+          "line_ranges": [
+            [
+              55,
+              70
+            ]
+          ]
+        },
+        {
+          "path": "tests/utils/api_routes/__init__.py",
+          "symbols": [
+            "self route constants"
+          ],
+          "line_ranges": [
+            [
+              190,
+              193
+            ]
+          ]
+        },
+        {
+          "path": "frontend/app/lib/api/user/users.ts",
+          "symbols": [
+            "frontend route/client blast-radius evidence"
+          ],
+          "line_ranges": [
+            [
+              25,
+              40
+            ],
+            [
+              58,
+              75
+            ]
+          ]
+        }
+      ],
+      "related": [
+        "US-1",
+        "US-2",
+        "US-3",
+        "US-5"
+      ]
+    },
+    {
+      "id": "FR-005",
+      "text": "POST favorite MUST be idempotent and sequential duplicate-safe: create `UserToRecipe` if absent, otherwise update `is_favorite=true` without changing an existing rating. DELETE favorite MUST be idempotent: if a row exists, set `is_favorite=false`; if already absent or false, return the same successful status as the legacy route. New self write routes SHOULD delegate to the same service/repository path as legacy favorites so `assert_user_change_allowed`, rating preservation, and visibility rules remain consistent.",
+      "requirement_type": "functional",
+      "code_references": [
+        {
+          "path": "mealie/routes/users/ratings.py",
+          "symbols": [
+            "set_rating",
+            "add_favorite",
+            "remove_favorite"
+          ],
+          "line_ranges": [
+            [
+              54,
+              86
+            ]
+          ]
+        },
+        {
+          "path": "mealie/repos/repository_users.py",
+          "symbols": [
+            "RepositoryUserRatings` lookups"
+          ],
+          "line_ranges": [
+            [
+              78,
+              101
+            ]
+          ]
+        },
+        {
+          "path": "mealie/db/models/users/user_to_recipe.py",
+          "symbols": [
+            "unique favorite/rating association"
+          ],
+          "line_ranges": [
+            [
+              17,
+              30
+            ]
+          ]
+        }
+      ],
+      "related": [
+        "US-1",
+        "US-2"
+      ]
+    },
+    {
+      "id": "FR-006",
+      "text": "Favorite mutation and recipe detail/list 404s MUST use Mealie i18n, not hardcoded English. The required semantic no-entry key is `errors.no-entry-found`: implementation MUST either add that alias to `en-US` and call `self.t(\"errors.no-entry-found\")`, or obtain reviewer approval to use the verified existing key `self.t(\"exceptions.no-entry-found\")`. Do not introduce new hardcoded English 4xx response messages in this feature.",
+      "requirement_type": "functional",
+      "code_references": [
+        {
+          "path": "mealie/lang/messages/en-US.json",
+          "symbols": [
+            "verified `exceptions.no-entry-found"
+          ],
+          "line_ranges": [
+            [
+              45,
+              52
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/users/ratings.py",
+          "symbols": [
+            "current hardcoded `\"Not found.\"` 404 to replace"
+          ],
+          "line_ranges": [
+            [
+              23,
+              42
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/users/crud.py",
+          "symbols": [
+            "existing `ErrorResponse.respond` / `self.t` examples"
+          ],
+          "line_ranges": [
+            [
+              27,
+              36
+            ],
+            [
+              42,
+              63
+            ]
+          ]
+        },
+        {
+          "path": "mealie/services/recipe/recipe_service.py",
+          "symbols": [
+            "service raises no-entry-found style exception"
+          ],
+          "line_ranges": [
+            [
+              63,
+              68
+            ]
+          ]
+        }
+      ],
+      "related": [
+        "US-1",
+        "US-2",
+        "US-4"
+      ]
+    },
+    {
+      "id": "FR-007",
+      "text": "Add `favorited: bool` and `favorite_count: int` to `RecipeSummary` and therefore `Recipe`. For authenticated recipe reads, `favorited` reflects the current user's `is_favorite` row and `favorite_count` is the real count of `is_favorite=true` rows for each returned recipe. For anonymous public explore reads, `favorited` MUST be false but `favorite_count` MUST still be the real count; `favorite_count` defaults to 0 only when no favorite rows exist. Implement both authenticated `/api/recipes` routes and anonymous `/api/explore/groups/{group_slug}/recipes` routes.",
+      "requirement_type": "functional",
+      "code_references": [
+        {
+          "path": "mealie/schema/recipe/recipe.py",
+          "symbols": [
+            "RecipeSummary",
+            "Recipe"
+          ],
+          "line_ranges": [
+            [
+              116,
+              149
+            ],
+            [
+              182,
+              190
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/recipe/recipe_crud_routes.py",
+          "symbols": [
+            "authenticated recipe controller/list/detail"
+          ],
+          "line_ranges": [
+            [
+              85,
+              89
+            ],
+            [
+              340,
+              395
+            ],
+            [
+              415,
+              424
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/explore/controller_public_recipes.py",
+          "symbols": [
+            "public anonymous recipe controller/list/detail"
+          ],
+          "line_ranges": [
+            [
+              20,
+              41
+            ],
+            [
+              67,
+              92
+            ],
+            [
+              114,
+              125
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/explore/__init__.py",
+          "symbols": [
+            "explore route mount"
+          ],
+          "line_ranges": [
+            [
+              11,
+              22
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/_base/routers.py",
+          "symbols": [
+            "UserAPIRouter` auth dependency"
+          ],
+          "line_ranges": [
+            [
+              20,
+              24
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/_base/base_controllers.py",
+          "symbols": [
+            "BaseUserController` current user dependency"
+          ],
+          "line_ranges": [
+            [
+              139,
+              142
+            ]
+          ]
+        }
+      ],
+      "related": [
+        "US-4"
+      ]
+    },
+    {
+      "id": "FR-008",
+      "text": "Recipe favorite hydration MUST avoid N+1 and MUST NOT use `RepositoryRecipes.column_aliases` as a response projection mechanism. Use an actual SELECT/loader-compatible strategy: either add SQLAlchemy `column_property` / `hybrid_property` fields that Pydantic can read, or perform one batched lookup/aggregate keyed by current page/detail recipe ids and assign `favorited` / `favorite_count` before serialization. `column_aliases` may remain only for queryFilter/orderBy support.",
+      "requirement_type": "non_functional",
+      "code_references": [
+        {
+          "path": "mealie/repos/repository_generic.py",
+          "symbols": [
+            "page_all` projection",
+            "queryFilter",
+            "orderBy use of `column_aliases"
+          ],
+          "line_ranges": [
+            [
+              330,
+              355
+            ],
+            [
+              367,
+              370
+            ],
+            [
+              407,
+              415
+            ]
+          ]
+        },
+        {
+          "path": "mealie/repos/repository_recipes.py",
+          "symbols": [
+            "column_aliases",
+            "by_user",
+            "rating alias precedent"
+          ],
+          "line_ranges": [
+            [
+              36,
+              52
+            ],
+            [
+              72,
+              93
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/recipe/recipe_crud_routes.py",
+          "symbols": [
+            "authenticated list/detail serialization paths"
+          ],
+          "line_ranges": [
+            [
+              367,
+              395
+            ],
+            [
+              415,
+              424
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/explore/controller_public_recipes.py",
+          "symbols": [
+            "public list/detail serialization paths"
+          ],
+          "line_ranges": [
+            [
+              67,
+              92
+            ],
+            [
+              114,
+              125
+            ]
+          ]
+        },
+        {
+          "path": "mealie/db/models/recipe/recipe.py",
+          "symbols": [
+            "favorited_by` relationship"
+          ],
+          "line_ranges": [
+            [
+              68,
+              74
+            ]
+          ]
+        },
+        {
+          "path": "mealie/repos/repository_users.py",
+          "symbols": [
+            "existing favorite/rating lookup helpers"
+          ],
+          "line_ranges": [
+            [
+              82,
+              96
+            ]
+          ]
+        }
+      ],
+      "related": [
+        "US-4"
+      ]
+    },
+    {
+      "id": "FR-009",
+      "text": "Add a hard cleanup remedy for `users_to_recipes`. First, add an Alembic migration that enforces `ON DELETE CASCADE` (or DB-equivalent recreated constraints for supported databases) on both `users_to_recipes.user_id` and `users_to_recipes.recipe_id`. Second, extend `RepositoryUsers.delete` to remove `UserToRecipe` rows for the deleted user before `super().delete()`, mirroring the existing recipe-delete cleanup path. Preserve existing `RepositoryRecipes._delete_recipe` cleanup and add regression tests for both user deletion and recipe deletion.",
+      "requirement_type": "functional",
+      "code_references": [
+        {
+          "path": "mealie/db/models/users/user_to_recipe.py",
+          "symbols": [
+            "FKs have no `ondelete"
+          ],
+          "line_ranges": [
+            [
+              22,
+              24
+            ]
+          ]
+        },
+        {
+          "path": "mealie/alembic/versions/2024-03-18-02.28.15_d7c6efd2de42_migrate_favorites_and_ratings_to_user_.py",
+          "symbols": [
+            "existing constraints/indexes"
+          ],
+          "line_ranges": [
+            [
+              164,
+              179
+            ]
+          ]
+        },
+        {
+          "path": "mealie/repos/repository_recipes.py",
+          "symbols": [
+            "recipe-delete cleanup"
+          ],
+          "line_ranges": [
+            [
+              110,
+              128
+            ]
+          ]
+        },
+        {
+          "path": "mealie/repos/repository_users.py",
+          "symbols": [
+            "user delete lacks cleanup"
+          ],
+          "line_ranges": [
+            [
+              55,
+              65
+            ]
+          ]
+        },
+        {
+          "path": "mealie/db/models/users/users.py",
+          "symbols": [
+            "cascade relationship not applied to favorites"
+          ],
+          "line_ranges": [
+            [
+              84,
+              115
+            ]
+          ]
+        },
+        {
+          "path": "mealie/db/models/recipe/recipe.py",
+          "symbols": [
+            "favorite relationship lacks cascade"
+          ],
+          "line_ranges": [
+            [
+              68,
+              74
+            ]
+          ]
+        }
+      ],
+      "related": [
+        "US-6"
+      ]
+    },
+    {
+      "id": "FR-010",
+      "text": "Legacy user-id favorite routes MUST remain operational and backed by the same storage/service path: `GET /api/users/{id}/favorites`, `POST /api/users/{id}/favorites/{slug}`, and `DELETE /api/users/{id}/favorites/{slug}`. Existing frontend favorite badge and user favorites page behavior MUST not be broken; backend-only scope may update tests/routes but MUST NOT manually edit generated frontend types.",
+      "requirement_type": "functional",
+      "code_references": [
+        {
+          "path": "mealie/routes/users/ratings.py",
+          "symbols": [
+            "legacy ratings/favorites routes"
+          ],
+          "line_ranges": [
+            [
+              44,
+              86
+            ]
+          ]
+        },
+        {
+          "path": "frontend/app/components/Domain/Recipe/RecipeFavoriteBadge.vue",
+          "symbols": [
+            "favorite UI calls"
+          ],
+          "line_ranges": [
+            [
+              48,
+              65
+            ]
+          ]
+        },
+        {
+          "path": "frontend/app/pages/user/[id]/favorites.vue",
+          "symbols": [
+            "favorites page query"
+          ],
+          "line_ranges": [
+            [
+              30,
+              32
+            ]
+          ]
+        },
+        {
+          "path": "frontend/app/lib/api/user/users.ts",
+          "symbols": [
+            "existing client favorite methods"
+          ],
+          "line_ranges": [
+            [
+              50,
+              64
+            ]
+          ]
+        }
+      ],
+      "related": [
+        "US-5"
+      ]
+    },
+    {
+      "id": "FR-011",
+      "text": "Tests MUST meet input minimums: at least 3 unit tests for repository/service add, remove, and list behavior; at least 6 integration tests covering favorite/unfavorite/refavorite idempotency, anonymous public reads with `favorited=false` and real `favorite_count`, cross-group 404, count increments, user and recipe deletion cleanup, and pagination; and at least 2 multitenant tests covering cross-household favorite visibility and different-group recipe invisibility.",
+      "requirement_type": "functional",
+      "code_references": [
+        {
+          "path": "tests/fixtures/fixture_users.py",
+          "symbols": [
+            "user/household fixtures"
+          ],
+          "line_ranges": [
+            [
+              17,
+              106
+            ]
+          ]
+        },
+        {
+          "path": "tests/fixtures/fixture_recipe.py",
+          "symbols": [
+            "recipe fixtures"
+          ],
+          "line_ranges": [
+            [
+              31,
+              85
+            ]
+          ]
+        },
+        {
+          "path": "tests/multitenant_tests/test_multitenant_cases.py",
+          "symbols": [
+            "multitenant test pattern"
+          ],
+          "line_ranges": [
+            [
+              22,
+              74
+            ]
+          ]
+        },
+        {
+          "path": "tests/integration_tests/user_recipe_tests/test_recipe_cross_household.py",
+          "symbols": [
+            "cross-household recipe test pattern"
+          ],
+          "line_ranges": [
+            [
+              45,
+              70
+            ]
+          ]
+        },
+        {
+          "path": "tests/integration_tests/user_recipe_tests/test_recipe_ratings.py",
+          "symbols": [
+            "existing favorites test pattern"
+          ],
+          "line_ranges": [
+            [
+              55,
+              70
+            ]
+          ]
+        }
+      ],
+      "related": [
+        "US-1",
+        "US-2",
+        "US-3",
+        "US-4",
+        "US-6"
+      ]
+    },
+    {
+      "id": "FR-012",
+      "text": "Migration and API documentation work MUST follow Mealie conventions: create migrations with the `YYYY-MM-DD-HH.MM.SS_<revision>_<snake_case_desc>.py` naming pattern, include complete FastAPI docstrings and `response_model` annotations for all new/changed endpoints, and run code generation after Pydantic schema changes. Only `en-US` translation files may be changed for new strings.",
+      "requirement_type": "non_functional",
+      "code_references": [
+        {
+          "path": "mealie/alembic/versions/2026-05-18-16.27.05_2187537c52b8_add_table_for_ai_providers.py",
+          "symbols": [
+            "migration naming/header convention"
+          ],
+          "line_ranges": [
+            [
+              1,
+              23
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/users/ratings.py",
+          "symbols": [
+            "endpoint docstring / response_model examples"
+          ],
+          "line_ranges": [
+            [
+              44,
+              86
+            ]
+          ]
+        },
+        {
+          "path": "mealie/routes/explore/controller_public_recipes.py",
+          "symbols": [
+            "response_model examples"
+          ],
+          "line_ranges": [
+            [
+              30,
+              41
+            ],
+            [
+              114,
+              115
+            ]
+          ]
+        },
+        {
+          "path": "mealie/lang/messages/en-US.json",
+          "symbols": [
+            "locale file to update if adding strings"
+          ],
+          "line_ranges": [
+            [
+              1,
+              3
+            ],
+            [
+              45,
+              52
+            ]
+          ]
+        }
+      ],
+      "related": [
+        "US-3",
+        "US-4",
+        "US-6"
+      ]
+    }
+  ],
+  "success_criteria": [
+    {
+      "id": "SC-001",
+      "text": "Self favorite POST is idempotent",
+      "metric": "sequential duplicate POST result",
+      "threshold": "second POST returns success and canonical row/state remains unique for `(user_id, recipe_id)`"
+    },
+    {
+      "id": "SC-002",
+      "text": "Self favorite DELETE is idempotent",
+      "metric": "sequential duplicate DELETE result",
+      "threshold": "second DELETE returns success and recipe is not favorited"
+    },
+    {
+      "id": "SC-003",
+      "text": "Self favorite list is paginated recipes",
+      "metric": "response contract at `/api/users/self/favorites`",
+      "threshold": "`PaginationBase[RecipeSummary]` fields match for at least 3 favorites across 2 pages"
+    },
+    {
+      "id": "SC-004",
+      "text": "Recipe list hydration has no N+1",
+      "metric": "query count on seeded pages",
+      "threshold": "bounded query count independent of page size; p95 latency must not regress by more than 10% if a benchmark baseline exists"
+    },
+    {
+      "id": "SC-005",
+      "text": "Recipe favorite metadata is correct",
+      "metric": "response field assertions",
+      "threshold": "favoriting user sees `favorited=true`; other/anonymous users see `favorited=false`; all see correct `favorite_count`"
+    },
+    {
+      "id": "SC-006",
+      "text": "Tenant isolation holds",
+      "metric": "integration/multitenant tests",
+      "threshold": "cross-group attempts return i18n-backed 404 and cross-tenant favorites do not leak in list/count state"
+    },
+    {
+      "id": "SC-007",
+      "text": "Cleanup is enforced",
+      "metric": "user-delete and recipe-delete regression tests plus migration inspection",
+      "threshold": "`users_to_recipes` rows are cleaned for both user and recipe deletion"
+    },
+    {
+      "id": "SC-008",
+      "text": "Input test minimums met",
+      "metric": "test count by category",
+      "threshold": ">=3 unit, >=6 integration, >=2 multitenant tests"
+    }
+  ],
+  "self_concerns": [
+    "NC-001 storage reuse requires reviewer acceptance",
+    "FR-006 uses verified exceptions.no-entry-found key unless errors.no-entry-found is added",
+    "FR-008 leaves projection implementation choice to coding design"
+  ]
+}

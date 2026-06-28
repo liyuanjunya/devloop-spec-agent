@@ -1,0 +1,72 @@
+llm:
+  primary_model: claude-opus-4-7
+  cross_review_model: gpt-5.5
+  primary_provider: anthropic
+  cross_review_provider: openai
+  max_retries: 3
+  timeout_seconds: 120
+  max_tokens_default: 8192
+
+explorer:
+  max_tool_calls_soft: 50
+  max_tool_calls_hard: 100
+  parallel: true
+  perspectives:
+    - data
+    - api
+    - ui
+    - test
+    - history
+
+reviewer:
+  max_tool_calls_soft: 30
+  max_tool_calls_hard: 80
+  parallel: true
+  angles:
+    - architecture
+    - completeness
+    - executability
+    - consistency
+
+orchestrator:
+  max_total_iterations: 20
+  no_progress_threshold: 3
+  enable_multi_view_explorer: true
+  enable_multi_candidate_approach: true
+  enable_multi_reviewer: true
+  citation_verify_max_attempts: 3
+  test_executability_max_attempts: 2
+  test_executability_timeout_s: 30
+
+cache:
+  backend: sqlite
+  ttl_days: 7
+
+paths:
+  workspace_root: ./specs
+  prompts_dir: ./prompts
+  cache_dir: ./.cache/devloop
+
+repo_skeleton:
+  target_tokens: 1024
+  max_files_per_module: 5
+  excluded_dirs:
+    - node_modules
+    - .git
+    - .venv
+    - venv
+    - __pycache__
+    - dist
+    - build
+    - target
+    - .idea
+    - .vscode
+    - .pytest_cache
+    - .mypy_cache
+  supported_languages:
+    - python
+    - javascript
+    - typescript
+    - go
+    - rust
+    - java

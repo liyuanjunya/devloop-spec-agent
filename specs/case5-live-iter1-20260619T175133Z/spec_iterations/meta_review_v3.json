@@ -1,0 +1,130 @@
+{
+  "judge_model": "claude-opus-4.7",
+  "rewriter_model": "claude-opus-4.7",
+  "iteration": "v3 -> v4",
+  "verdict": "REWRITE_REQUIRED",
+  "v3_review_summary": {
+    "architecture": {
+      "verdict": "REJECT",
+      "critical": 1,
+      "high": 1,
+      "medium": 2,
+      "key_finding": "NEW-ARCH-C-1: single rollbackable transaction promise impossible with internally-committing repo methods; NEW-ARCH-H-1: after-commit dispatch cannot be rolled back."
+    },
+    "completeness": {
+      "verdict": "NEEDS_REFINE",
+      "critical": 0,
+      "high": 1,
+      "key_finding": "COMP-H-013: US-9 still requires localized response body on a 204/no-body path (FR-020/SC-026)."
+    },
+    "consistency": {
+      "verdict": "REVISE",
+      "blocking": 1,
+      "high": 1,
+      "medium": 2,
+      "low": 1,
+      "key_findings": [
+        "C3-001: event dispatch both after-commit AND transaction-rollback protected — impossible",
+        "C3-002: US-9 requires response body on 204 no-meal-plan path",
+        "C3-003: US-9/event-payload localization surface underspecified (no message_key on payload)",
+        "C3-004: Out-of-scope locale text regressed to single-locale claim",
+        "C3-005: one-way FR<->SC links remain"
+      ]
+    },
+    "executability": {
+      "verdict": "NEEDS_REFINE",
+      "critical": 2,
+      "high": 2,
+      "medium": 3,
+      "key_findings": [
+        "EXEC-C-001: single transaction impossible reusing add_recipe_ingredients_to_list (internal commits)",
+        "EXEC-C-002: event exactly-once + rollback impossible with after-commit dispatch",
+        "EXEC-H-001: run-now 204 contract still contradicts US-9",
+        "EXEC-H-002: localized event/message surface underspecified",
+        "EXEC-M-001: locale OOS text contradicts corrected locale policy",
+        "EXEC-M-002: PostgreSQL default isolation level wording wrong (REPEATABLE READ -> READ COMMITTED)",
+        "EXEC-M-003: FR-014/FR-023 should cite filter implementation lines"
+      ]
+    }
+  },
+  "convergent_root_cause": "Six of seven critical+high findings across all 4 axes converge on a single architectural impossibility: v3 promised that a single DB transaction could rollback CAS marker + shopping-list writes + post-commit event dispatch. This is impossible because (a) RepositoryGeneric.create_many/update_many/update call session.commit() internally (mealie/repos/repository_generic.py:195-208, :210-226, :228-244); (b) bulk_create_items delegates to those committing methods; (c) EventBusService.dispatch publishes immediately to external sinks. A reviewer-recommended outbox pattern + no-commit refactor cleanly resolves all four overlapping findings.",
+  "actions": [
+    {
+      "id": "META-V3-001",
+      "priority": 1,
+      "severity": "critical",
+      "axes": ["architecture", "executability", "consistency", "completeness"],
+      "sources": ["NEW-ARCH-C-1", "NEW-ARCH-H-1", "EXEC-C-001", "EXEC-C-002", "C3-001", "COMP-H-013"],
+      "action": "Escalate the transactional architecture decision as NC-004 with recommended_default=outbox pattern + no-commit refactor; if_rejected=partial-failure tolerance with sync_attempt_id idempotency. Add FR-030 (commit:bool=True kwarg on RepositoryGeneric.create_many/update_many/update + ShoppingListService.bulk_create_items/add_recipe_ingredients_to_list — guards the internal session.commit() calls). Add FR-031 (event_outbox table + dispatch_event_outbox minutely scheduler task + RepositoryEventOutbox). Rewrite FR-011 to use the outbox pattern: open outer `with session.begin():`, CAS UPDATE, bulk_create_items(commit=False), INSERT event_outbox row, single atomic commit. Rewrite FR-012 to clarify outbox-aware rollback semantics. Rewrite FR-020 to mirror the outbox pattern in force-mode. Update FR-024 step D to create event_outbox table + indices. Update SC-007/SC-013/SC-025 to reference outbox row counts instead of dispatch counts. Add SC-030 (commit=False suppresses internal commit), SC-031 (dispatcher poll + retry behavior), SC-032 (atomic 3-stage rollback)."
+    },
+    {
+      "id": "META-V3-002",
+      "priority": 2,
+      "severity": "high",
+      "axes": ["completeness", "consistency", "executability"],
+      "sources": ["COMP-H-013", "C3-002", "EXEC-H-001"],
+      "action": "Rewrite US-9 description / independent_test / AC1 / AC2 / AC3 to align with the FR-020 / SC-026 204-no-body contract: precondition-failure response is 204 with zero body bytes; i18n key surfaces in (a) server-side WARN logs and (b) the new optional `message_key` field on EventMealPlanAutoSyncedData (FR-021)."
+    },
+    {
+      "id": "META-V3-003",
+      "priority": 2,
+      "severity": "high",
+      "axes": ["executability", "consistency"],
+      "sources": ["EXEC-H-002", "C3-003"],
+      "action": "Add optional `message_key: str | None = None` field to EventMealPlanAutoSyncedData (FR-021). The outbox dispatcher (FR-031) forwards it into EventBusService.dispatch(..., message=message_key or '') so Apprise/webhook subscribers receive the key via EventBusMessage.body. Update FR-022 to explicitly state the i18n keys surface in (a) logs and (b) message_key field — NOT in HTTP response body."
+    },
+    {
+      "id": "META-V3-004",
+      "priority": 3,
+      "severity": "medium",
+      "axes": ["consistency", "executability"],
+      "sources": ["C3-004", "EXEC-M-001"],
+      "action": "Replace the stale Out-of-Scope sentence 'Mealie currently ships only en-US.json' with 'Mealie ships 40+ Crowdin-managed locale files at mealie/lang/messages/*.json; per .github/copilot-instructions.md Translations section only en-US.json is editable; PRs touching other locales are rejected.' This aligns with FR-022 + Assumption #3."
+    },
+    {
+      "id": "META-V3-005",
+      "priority": 3,
+      "severity": "medium",
+      "axes": ["executability"],
+      "sources": ["EXEC-M-002"],
+      "action": "Fix the two-replica edge case wording: PostgreSQL default isolation level is READ COMMITTED (not REPEATABLE READ); add note that READ COMMITTED still serializes concurrent UPDATEs on the same row via row-level write locks. SQLite's per-statement lock wording is retained."
+    },
+    {
+      "id": "META-V3-006",
+      "priority": 3,
+      "severity": "medium",
+      "axes": ["executability"],
+      "sources": ["EXEC-M-003"],
+      "action": "Add citations to mealie/repos/repository_generic.py for the actual filter implementation: _filter_builder L94-102, get_one L156-179, page_all L315-355 — on FR-014 and FR-023 — so the 'WHERE clause on every query' claim is concretely verifiable."
+    },
+    {
+      "id": "META-V3-007",
+      "priority": 4,
+      "severity": "low",
+      "axes": ["consistency"],
+      "sources": ["C3-005"],
+      "action": "Add reciprocal SC->FR links: FR-020.related_success_criteria += SC-026; FR-022.related_success_criteria += SC-026; FR-021.related_success_criteria += SC-027; FR-024.related_success_criteria += SC-027; FR-001.related_success_criteria += SC-028; FR-023.related_success_criteria += SC-029."
+    }
+  ],
+  "v3_to_v4_severity_rollup": {
+    "v3_critical": 3,
+    "v3_high": 3,
+    "v3_medium": 4,
+    "v3_low": 1,
+    "actions_consolidated": 7,
+    "expected_v4_critical": 0,
+    "expected_v4_high": 0
+  },
+  "files_to_produce": [
+    "spec_v4.json",
+    "spec_v4.md",
+    "rewrite_v3_to_v4.md",
+    "build_v4.py"
+  ],
+  "validators_expected": {
+    "A4_F3_schema": "PASS",
+    "A5_citation": 0,
+    "B3_trace": 0,
+    "B1_roundtrip": "PASS"
+  }
+}

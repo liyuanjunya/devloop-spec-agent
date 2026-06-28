@@ -1,0 +1,351 @@
+{
+  "schema_version": "1.0",
+  "case_id": "case4-recipe-n1-20260619T124200Z",
+  "title": "Recipe List N+1 Performance Refactor on Mealie",
+  "intent_type": "performance",
+  "scope": ["repo", "schema", "service", "test"],
+  "selected_approach": "Conservative (extend RecipeSummary.loader_options() to convert M2M joinedloads to selectinloads and chain selectinload(Tool.households_with_tool); add tests/integration_tests/test_recipe_list_query_count.py)",
+  "user_stories": [
+    {
+      "id": "US-1",
+      "priority": "P1",
+      "actor": "Backend developer (Mealie maintainer)",
+      "story": "The GET /api/recipes JSON response — field set, declaration order, camelCase aliases (orgURL special-case included), and pagination envelope (page, perPage, total, totalPages, items, next, previous) — is byte-identical to the pre-refactor baseline for identical seed data.",
+      "rationale": "Existing UI consumers (RecipeCard, RecipeCardMobile, RecipeCardSection, RecipeDialogSearch) and generated TypeScript types (frontend/app/lib/api/types/recipe.ts) keep working without regeneration.",
+      "acceptance": "JSON diff between pre- and post-refactor responses on the same seeded dataset returns {} (no changes). Covered by FR-001, FR-002, SC-002."
+    },
+    {
+      "id": "US-2",
+      "priority": "P1",
+      "actor": "Backend developer (Mealie maintainer)",
+      "story": "The SQL statement count emitted by GET /api/recipes is a small constant, independent of how many recipes are returned.",
+      "rationale": "Page latency no longer scales linearly with library size; future regressions can be caught quickly.",
+      "acceptance": "count(queries for 100 recipes) <= count(queries for 10 recipes) + 3 AND count(queries for 100 recipes) <= 8 typical / <= 10 absolute. Covered by FR-003..FR-006, FR-009, SC-001."
+    },
+    {
+      "id": "US-3",
+      "priority": "P2",
+      "actor": "Backend developer (Mealie maintainer)",
+      "story": "Every existing unit, integration, and multi-tenant test that touches RepositoryRecipes.page_all and RecipeSummary passes without modification.",
+      "rationale": "The refactor's correctness is verified by the existing regression surface (response shape, multi-household filtering, organizer filtering, sort ordering, validator coercion).",
+      "acceptance": "task py:test exits 0; no new skips, xfails, or warnings. Strict regression list in test_perspective.md §8 all pass. Covered by FR-013, SC-003."
+    },
+    {
+      "id": "US-4",
+      "priority": "P2",
+      "actor": "Backend developer (Mealie maintainer)",
+      "story": "A new test tests/integration_tests/test_recipe_list_query_count.py arms a SQLAlchemy before_cursor_execute listener on the shared engine, runs the warm-up + measured GET /api/recipes flow at two recipe-count scales (10 and 100), and asserts the query count does not grow.",
+      "rationale": "A careless re-introduction of a joinedload-on-M2M with LIMIT or a missing chained selectinload fails CI deterministically.",
+      "acceptance": "uv run pytest tests/integration_tests/test_recipe_list_query_count.py -v passes. Sync def; uses unique_user_fn_scoped; warms up; attaches listener inside try/finally event.remove block. Covered by FR-010, SC-005."
+    }
+  ],
+  "functional_requirements": [
+    {
+      "id": "FR-001",
+      "title": "Preserve exact RecipeSummary response fields",
+      "description": "The set, declaration order, and camelCase aliases of fields on each items[*] element of the GET /api/recipes response must be unchanged from the pre-refactor baseline. Exact wire fields: id, userId, householdId, groupId, name, slug, image, recipeServings, recipeYieldQuantity, recipeYield, totalTime, prepTime, cookTime, performTime, description, recipeCategory[] (each: {id, name, slug, groupId}), tags[] (each: {id, name, slug, groupId}), tools[] (each: {id, name, slug, groupId, householdsWithTool[]}), rating, orgURL, dateAdded, dateUpdated, createdAt, updatedAt, lastMade. orgURL is a special-cased Pydantic alias (Field(alias='orgURL')) and must NOT be re-camelized. No fields are added or removed.",
+      "code_references": [
+        {"path": "mealie/schema/recipe/recipe.py", "line_ranges": "116-149", "note": "RecipeSummary field declarations including tools: list[RecipeTool] = [] and the explicit org_url alias on line 141"},
+        {"path": "mealie/routes/recipe/recipe_crud_routes.py", "line_ranges": "392", "note": "Serialization via orjson.dumps(pagination_response.model_dump(by_alias=True))"},
+        {"path": "frontend/app/lib/api/types/recipe.ts", "line_ranges": "310-336", "note": "Current 26-field TS contract"}
+      ]
+    },
+    {
+      "id": "FR-002",
+      "title": "Preserve pagination behavior",
+      "description": "The PaginationBase[RecipeSummary] envelope keys page, perPage, total, totalPages, items, next, previous must be returned with the same semantics: total = unique recipe count matching filters, totalPages = ceil(total / perPage), perPage=-1 → 'all rows', page=-1 → 'last page', and next/previous URLs built by set_pagination_guides. The 'apply options late' invariant must be preserved (loader options are attached AFTER add_pagination_to_query).",
+      "code_references": [
+        {"path": "mealie/repos/repository_generic.py", "line_ranges": "357-405", "note": "add_pagination_to_query — COUNT subquery L376-377, perPage=-1 handling L382-385, total_pages L388, page=-1 L392-394"},
+        {"path": "mealie/repos/repository_recipes.py", "line_ranges": "274,277", "note": "Canonical 'add_pagination_to_query THEN .options(...)' sequence"},
+        {"path": "mealie/routes/recipe/recipe_crud_routes.py", "line_ranges": "387-390", "note": "set_pagination_guides"},
+        {"path": "mealie/schema/response/pagination.py", "line_ranges": "51-94", "note": "PaginationBase fields"}
+      ]
+    },
+    {
+      "id": "FR-003",
+      "title": "Eager-load recipe_category via selectinload",
+      "description": "Replace joinedload(RecipeModel.recipe_category) with selectinload(RecipeModel.recipe_category) in RecipeSummary.loader_options(). Rationale: joinedload on M2M collection combined with LIMIT/OFFSET triggers SQLAlchemy's subquery+OUTER JOIN strategy with cartesian-product row inflation. selectinload issues one extra SELECT … WHERE recipes_to_categories.recipe_id IN (...) statement regardless of page size.",
+      "code_references": [
+        {"path": "mealie/schema/recipe/recipe.py", "line_ranges": "171", "note": "Current joinedload(RecipeModel.recipe_category) line to replace"},
+        {"path": "mealie/db/models/recipe/recipe.py", "line_ranges": "98-100", "note": "recipe_category M2M relationship via recipes_to_categories"},
+        {"path": "mealie/db/models/recipe/category.py", "line_ranges": "35-41", "note": "recipes_to_categories table — recipe_id and category_id both indexed; no migration needed"}
+      ]
+    },
+    {
+      "id": "FR-004",
+      "title": "Eager-load tags via selectinload",
+      "description": "Replace joinedload(RecipeModel.tags) with selectinload(RecipeModel.tags) in RecipeSummary.loader_options(). Same rationale as FR-003.",
+      "code_references": [
+        {"path": "mealie/schema/recipe/recipe.py", "line_ranges": "172", "note": "Current joinedload(RecipeModel.tags) line to replace"},
+        {"path": "mealie/db/models/recipe/recipe.py", "line_ranges": "138", "note": "tags M2M relationship via recipes_to_tags"},
+        {"path": "mealie/db/models/recipe/tag.py", "line_ranges": "19-25", "note": "recipes_to_tags table — recipe_id and tag_id indexed"}
+      ]
+    },
+    {
+      "id": "FR-005",
+      "title": "Eager-load tools via selectinload",
+      "description": "Replace joinedload(RecipeModel.tools) with selectinload(RecipeModel.tools) in RecipeSummary.loader_options(). Same rationale as FR-003.",
+      "code_references": [
+        {"path": "mealie/schema/recipe/recipe.py", "line_ranges": "173", "note": "Current joinedload(RecipeModel.tools) line to replace"},
+        {"path": "mealie/db/models/recipe/recipe.py", "line_ranges": "101", "note": "tools M2M relationship via recipes_to_tools"},
+        {"path": "mealie/db/models/recipe/tool.py", "line_ranges": "25-31", "note": "recipes_to_tools table"}
+      ]
+    },
+    {
+      "id": "FR-006",
+      "title": "Chain selectinload(Tool.households_with_tool) off the tools loader",
+      "description": "Chain selectinload(Tool.households_with_tool) off the selectinload(RecipeModel.tools) loader so the load becomes selectinload(RecipeModel.tools).selectinload(Tool.households_with_tool). Rationale: RecipeTool.households_with_tool is list[str] populated by a @field_validator(mode='before') that iterates household.slug for household in v. Tool.households_with_tool is a default lazy='select' M2M relationship. Without the chained selectinload, every unique tool in the page triggers one SELECT FROM households JOIN households_to_tools WHERE tool_id = ? during pagination_response.model_dump(by_alias=True) — this is the dominant N+1.",
+      "code_references": [
+        {"path": "mealie/schema/recipe/recipe.py", "line_ranges": "83-95", "note": "RecipeTool + convert_households_to_slugs validator that triggers the lazy load"},
+        {"path": "mealie/db/models/recipe/tool.py", "line_ranges": "54-56", "note": "Tool.households_with_tool M2M relationship — default lazy='select'"},
+        {"path": "mealie/db/models/recipe/tool.py", "line_ranges": "17-23", "note": "households_to_tools table — household_id and tool_id indexed"},
+        {"path": "mealie/schema/recipe/recipe_tool.py", "line_ranges": "36-39", "note": "Prior art: RecipeToolOut.loader_options uses selectinload(Tool.households_with_tool)"},
+        {"path": "mealie/schema/recipe/recipe_ingredient.py", "line_ranges": "117-123", "note": "Symmetric prior art for IngredientFood.households_with_ingredient_food"}
+      ]
+    },
+    {
+      "id": "FR-007",
+      "title": "Preserve joinedload(RecipeModel.user).load_only(User.household_id)",
+      "description": "The fourth loader entry must remain joinedload(RecipeModel.user).load_only(User.household_id). Rationale: RecipeModel.household_id is an AssociationProxy through user (association_proxy('user', 'household_id')); the proxy resolution requires recipe.user to be resident on the row. Dropping this loader silently regresses to a per-row lazy load on recipe.user.household_id during RecipeSummary.model_validate — re-introducing the N+1. A 1:1 joinedload adds no cartesian risk.",
+      "code_references": [
+        {"path": "mealie/schema/recipe/recipe.py", "line_ranges": "174", "note": "Current joinedload(RecipeModel.user).load_only(User.household_id) — KEEP unchanged"},
+        {"path": "mealie/db/models/recipe/recipe.py", "line_ranges": "55-56", "note": "household_id = association_proxy('user', 'household_id')"},
+        {"path": "mealie/db/models/recipe/recipe.py", "line_ranges": "59", "note": "user 1:1 relationship — orm.relationship('User', uselist=False, foreign_keys=[user_id])"}
+      ]
+    },
+    {
+      "id": "FR-008",
+      "title": "Preserve the 'apply options late' invariant",
+      "description": "RepositoryRecipes.page_all must continue to call q = q.options(*RecipeSummary.loader_options()) AFTER add_pagination_to_query(q, pagination_result) — i.e., the line ordering at mealie/repos/repository_recipes.py:274,277 is unchanged. The COUNT subquery must NOT see loader options, otherwise total regresses (commit 7b325082). Implementation note: this requirement is satisfied automatically by editing only loader_options() and leaving page_all unchanged.",
+      "code_references": [
+        {"path": "mealie/repos/repository_recipes.py", "line_ranges": "274,277", "note": "Load-bearing sequence: add_pagination_to_query at 274, then q.options(*RecipeSummary.loader_options()) at 277"},
+        {"path": "mealie/repos/repository_generic.py", "line_ranges": "341-342", "note": "Mantra: 'Apply options late, so they do not get used for counting'"},
+        {"path": "mealie/repos/repository_generic.py", "line_ranges": "376-377", "note": "COUNT subquery: select(func.count()).select_from(query.order_by(None).distinct().subquery())"}
+      ]
+    },
+    {
+      "id": "FR-009",
+      "title": "Query-count bound is a small constant",
+      "description": "The number of cursor executes emitted by engine.execute during a GET /api/recipes?perPage={N} call (after the per-session warm-up) must be: (a) RELATIVE bound — count(queries for 100 recipes) <= count(queries for 10 recipes) + 3; (b) ABSOLUTE bound — <= 8 queries for perPage <= 500 (typical), <= 10 queries for perPage <= 1000 (absorbs SQLAlchemy IN-list chunking at the default 500-row split). Expected post-refactor minimum is 6: 1 COUNT + 1 parent SELECT with joinedload(user) + 3 selectinloads (recipe_category, tags, tools) + 1 chained selectinload (Tool.households_with_tool). Spec ceiling is relaxed from input.md's literal <= 5 to <= 8 because the post-refactor minimum is provably 6, not 5 (see NC-003).",
+      "code_references": [
+        {"path": "mealie/schema/recipe/recipe.py", "line_ranges": "168-175", "note": "Loader options that produce the 4 child SELECTs"},
+        {"path": "mealie/repos/repository_recipes.py", "line_ranges": "274,277", "note": "COUNT + parent SELECT"},
+        {"path": "mealie/repos/repository_generic.py", "line_ranges": "376-377", "note": "COUNT subquery"},
+        {"path": "exploration/consolidated.md", "line_ranges": "see §3", "note": "Full trace synthesis across perspectives"}
+      ]
+    },
+    {
+      "id": "FR-010",
+      "title": "New regression test tests/integration_tests/test_recipe_list_query_count.py",
+      "description": "Add tests/integration_tests/test_recipe_list_query_count.py containing a sync def test that: (1) imports the global engine from mealie.db.db_setup; (2) uses the function-scoped fixture unique_user_fn_scoped; (3) seeds N recipes (10 then +90), each decorated with 3 tags + 3 categories + 3 tools, using the bulk pattern db.recipes.create_many([Recipe(...), ...]) modelled on test_recipe_crud.py:1534-1558; (4) warms up the test client with one throwaway api_client.get(api_routes.recipes, params={'page': 1, 'perPage': 1}, headers=user.token) call before arming the listener; (5) attaches event.listen(engine, 'before_cursor_execute', on_query) inside a try/finally event.remove(...) block to avoid leakage across the session-scoped api_client fixture; (6) asserts len(body['items']), body['total'], and the two query-count bounds (relative <= count_small + 3, absolute <= 10); (7) is a plain sync def — NOT async def — because Mealie's test suite uses TestClient (sync) and the engine is sa.create_engine(...) (sync); pytest-asyncio is not in pyproject.toml.",
+      "code_references": [
+        {"path": "mealie/db/db_setup.py", "line_ranges": "38,45", "note": "Sync engine global created via sa.create_engine"},
+        {"path": "tests/conftest.py", "line_ranges": "45-53", "note": "Session-scoped sync api_client fixture using TestClient(app)"},
+        {"path": "tests/fixtures/fixture_users.py", "line_ranges": "219-221", "note": "unique_user_fn_scoped function-scoped fixture"},
+        {"path": "tests/utils/api_routes/__init__.py", "line_ranges": "138", "note": "recipes = '/api/recipes'"},
+        {"path": "tests/integration_tests/user_recipe_tests/test_recipe_crud.py", "line_ranges": "1534-1558", "note": "Bulk create_many pattern with M2M decoration"},
+        {"path": "exploration/test_perspective.md", "line_ranges": "see §7", "note": "Full scaffolding & rationale"}
+      ]
+    },
+    {
+      "id": "FR-011",
+      "title": "Shared loader benefits adjacent endpoints",
+      "description": "Editing RecipeSummary.loader_options() transitively fixes every call site of RepositoryRecipes.page_all and any other location that splats RecipeSummary.loader_options(). The two user-facing list endpoints covered are: (a) GET /api/recipes — primary; (b) GET /api/explore/groups/{group_slug}/recipes — public/cross-household. Same page_all path with an injected query_filter for household.preferences.privateHousehold = FALSE AND settings.public = TRUE. GET /api/users/{id}/favorites does NOT share this code path — it returns UserRatingOut records via a different repository, so it is out of scope. Regression test scope is /api/recipes only (per input.md §1); explore-endpoint coverage is captured as self_concerns SC-C.",
+      "code_references": [
+        {"path": "mealie/routes/recipe/recipe_crud_routes.py", "line_ranges": "340-395", "note": "Primary GET /api/recipes call site at 370"},
+        {"path": "mealie/routes/explore/controller_public_recipes.py", "line_ranges": "30-92", "note": "Explore endpoint call site at 67-80 with privateHousehold filter at 61-65"},
+        {"path": "mealie/routes/organizers/controller_categories.py", "line_ranges": "131-134", "note": "per_page=-1 category-page call site, also benefits"},
+        {"path": "mealie/routes/households/controller_mealplan.py", "line_ranges": "65", "note": "Random-pick call site"},
+        {"path": "mealie/routes/users/ratings.py", "line_ranges": "44-52", "note": "Favorites/ratings — does NOT share page_all; out of scope"}
+      ]
+    },
+    {
+      "id": "FR-012",
+      "title": "Multi-tenant safety preserved",
+      "description": "The household/group filter chain must remain enforced on the parent SELECT. Specifically: (a) sa.select(self.model).filter(self.model.household_id.is_not(None)) at repository_recipes.py:238 (commit d02023e1 safety filter); (b) _build_recipe_filter (repository_recipes.py:295-337) — appends RecipeModel.group_id == self.group_id and (when set) RecipeModel.household_id == self.household_id, plus the explicit households query-param filter via RecipeModel.household_id.in_(households) at L335-336. selectinload does NOT add JOINs to the parent SELECT (it issues separate follow-up SELECT … WHERE recipe_id IN (...) statements), so these filters are preserved. The follow-up selectinload statements load child rows for already-filtered recipes — no cross-household or cross-group leakage is possible.",
+      "code_references": [
+        {"path": "mealie/repos/repository_recipes.py", "line_ranges": "238", "note": "household_id IS NOT NULL secondary safety filter"},
+        {"path": "mealie/repos/repository_recipes.py", "line_ranges": "295-337", "note": "_build_recipe_filter with group_id, household_id, and explicit households filter"},
+        {"path": "tests/integration_tests/user_recipe_tests/test_recipe_cross_household.py", "line_ranges": "46-102", "note": "Strict multi-household tests: test_get_all_recipes_includes_all_households + test_get_all_recipes_with_household_filter — must still pass"}
+      ]
+    },
+    {
+      "id": "FR-013",
+      "title": "rating and last_made remain correlated scalar subqueries",
+      "description": "The user-correlated column_aliases['rating'] (_get_rating_col_alias at repository_recipes.py:72-93) and column_aliases['last_made'] (_get_last_made_col_alias at repository_recipes.py:54-70) are NOT modified. They are correlated scalar subqueries on the parent SELECT — they emit zero extra cursor executes per row and are armed by by_user(user_id) (repository_recipes.py:49-52) which the controller already calls (recipe_crud_routes.py:370). Replacing them with JOINs would inflate rows and break test_order_by_last_made (tests/unit_tests/repository_tests/test_recipe_repository.py:593-647) and test_order_by_rating (L691-812). This requirement explicitly forbids introducing a new aggregate field (e.g., comments_count) — RecipeSummary's field set is locked by FR-001.",
+      "code_references": [
+        {"path": "mealie/repos/repository_recipes.py", "line_ranges": "39-93", "note": "column_aliases, by_user, _get_last_made_col_alias, _get_rating_col_alias — leave untouched"},
+        {"path": "tests/unit_tests/repository_tests/test_recipe_repository.py", "line_ranges": "593-812", "note": "test_order_by_last_made, test_coalesce_last_made, test_order_by_rating — must-still-pass"}
+      ]
+    }
+  ],
+  "success_criteria": [
+    {
+      "id": "SC-001",
+      "title": "Query-count growth is bounded by a constant",
+      "metric": "count(queries for 100 recipes) - count(queries for 10 recipes) <= 3",
+      "verification": "uv run pytest tests/integration_tests/test_recipe_list_query_count.py::test_recipe_list_query_count_does_not_grow_with_n -v passes",
+      "note": "Today this difference is approximately |distinct tools in 100 recipes| ≈ 70-90; post-refactor it is 0 (selectinload IN-list grows, statement count does not), modulo SQLAlchemy chunking."
+    },
+    {
+      "id": "SC-002",
+      "title": "Response shape diff against pre-refactor baseline = 0",
+      "metric": "Pre- and post-refactor JSON responses for the same seeded dataset are byte-identical after orjson serialization, modulo non-deterministic fields (createdAt, updatedAt, random UUIDs).",
+      "verification": "Existing tests in test_recipe_owner.py:42-57, test_recipe_crud.py:1530-1657, and test_recipe_cross_household.py:46-354 — all assert on field names/values/counts; passing without modification is the byte-shape equivalence proof.",
+      "note": "26 fields of RecipeSummary and pagination envelope keys are unchanged."
+    },
+    {
+      "id": "SC-003",
+      "title": "Existing test count passing unchanged",
+      "metric": "task py:test exit code 0; the strict-regression list in test_perspective.md §8 all pass; no test is skipped, xfailed, or modified; no new pytest warnings emitted.",
+      "verification": "uv run pytest tests/unit_tests/repository_tests/test_recipe_repository.py -v && uv run pytest tests/unit_tests/schema_tests/test_recipe.py -v && uv run pytest tests/integration_tests/user_recipe_tests/ -v all exit 0 with zero diff against pre-refactor counts."
+    },
+    {
+      "id": "SC-004",
+      "title": "Latency improvement documented (no hard p95 SLA)",
+      "metric": "PR description includes before/after query count for 100 recipes and an EXPLAIN ANALYZE on the parent SELECT for the 100-recipe case. No absolute p95 SLA asserted because Mealie's test suite has no baseline benchmark to compare against (unlike case-1 SC-004).",
+      "verification": "PR description body contains a fenced-code-block table with `before: N queries, after: 6 queries (or measured value)` for the 100-recipe case, plus an EXPLAIN ANALYZE text dump (Postgres preferred; SQLite acceptable with a note that the test DB is SQLite by default per mealie/db/db_setup.py:38 and task py:postgres is required for the Postgres pass).",
+      "note": "Explicit per input.md §4 which requires 'before/after query count comparison' and 'before/after EXPLAIN ANALYZE' but no p95 SLA."
+    },
+    {
+      "id": "SC-005",
+      "title": "New regression test exists and passes",
+      "metric": "tests/integration_tests/test_recipe_list_query_count.py exists, is collected by pytest (no collection errors), and passes locally and in CI.",
+      "verification": "uv run pytest tests/integration_tests/test_recipe_list_query_count.py -v exits 0; at least one test reported as passed."
+    },
+    {
+      "id": "SC-006",
+      "title": "No new SQL warnings in logs",
+      "metric": "Running task py:test does not emit any new SQLAlchemy warnings (SAWarning: Loader strategy will be overridden, Cartesian product warning, Cannot correlate ...).",
+      "verification": "uv run pytest tests/ 2>&1 | Select-String -Pattern 'SAWarning' returns the same count pre- and post-refactor."
+    },
+    {
+      "id": "SC-007",
+      "title": "Explore endpoint shares the fix (no code duplication)",
+      "metric": "A single RecipeSummary.loader_options() definition serves both GET /api/recipes and GET /api/explore/groups/{group_slug}/recipes. No parallel loader graph is added to the explore controller.",
+      "verification": "grep -rn 'selectinload(Tool.households_with_tool)' mealie/ returns occurrences only in mealie/schema/recipe/recipe.py (new), mealie/schema/recipe/recipe_tool.py (existing prior art) — NOT in mealie/routes/explore/."
+    }
+  ],
+  "edge_cases": [
+    {
+      "id": "EC-001",
+      "title": "Empty recipe list",
+      "scenario": "GET /api/recipes for a user whose household/group has zero recipes",
+      "expected": "Returns {items: [], total: 0, totalPages: 0, page: 1, perPage: 50, next: null, previous: null}. Query count: 1 COUNT (returns 0) + 1 parent SELECT (returns 0 rows) + 0 follow-up selectinloads (IN-list empty → SQLAlchemy elides) = ~2 statements typically."
+    },
+    {
+      "id": "EC-002",
+      "title": "Single recipe with no organizers",
+      "scenario": "Recipe with tags=[], recipe_category=[], tools=[]",
+      "expected": "Selectinloads issue with IN-list (recipe_id,) and return zero child rows for each — still 3 statements (categories, tags, tools) plus 1 for users plus parent + COUNT = 6. Chained selectinload(Tool.households_with_tool) elided when tools IN-list returns no Tool IDs. Within FR-009 bound."
+    },
+    {
+      "id": "EC-003",
+      "title": "Recipe with non-empty M2M but empty Tool.households_with_tool",
+      "scenario": "A tool created without any households_with_tool (default [] per Tool.__init__ at mealie/db/models/recipe/tool.py:78-80)",
+      "expected": "Chained selectinload issues with the tool's ID in the IN-list, returns zero households rows — still 1 statement. Validator convert_households_to_slugs returns [] (the `if not v: return []` branch at schema/recipe/recipe.py:89-90). Response: tools[i].householdsWithTool == []. Unchanged from current behavior."
+    },
+    {
+      "id": "EC-004",
+      "title": "Orphan/deleted FK references in M2M secondary tables",
+      "scenario": "recipes_to_tools, recipes_to_tags, recipes_to_categories carry FK constraints to tools.id / tags.id / categories.id; deletion of a Tool/Tag/Category cascades via SQLAlchemy session-level cascade (back_populates='recipes') in normal flow",
+      "expected": "selectinload IN-list lookup against recipes_to_* is FK-protected and cannot return phantom rows. No new failure modes introduced by the refactor."
+    },
+    {
+      "id": "EC-005",
+      "title": "Multi-tenant: recipes from another household must not leak",
+      "scenario": "unique_user (household A) and h2_user (household B, same group) both seed recipes; GET /api/recipes from unique_user MUST include both households' recipes (cross-household-within-group is the group_recipes semantic); GET /api/recipes?households=<B.householdId> MUST exclude unique_user's recipes",
+      "expected": "Both behaviors guaranteed by FR-012; selectinload cannot leak children of recipes filtered out of the parent SELECT. Verified by existing tests at tests/integration_tests/user_recipe_tests/test_recipe_cross_household.py:46-102."
+    },
+    {
+      "id": "EC-006",
+      "title": "perPage=-1 (load all rows)",
+      "scenario": "/organizers/categories/slug/{slug} controller passes per_page=-1 to page_all (mealie/routes/organizers/controller_categories.py:131-134); add_pagination_to_query (repository_generic.py:382-385) maps to 'no LIMIT'",
+      "expected": "Selectinload IN-list may contain >500 parent IDs → SQLAlchemy splits into 2 chunks (default selectin_loader.IN_BULK = 500). Total statements: COUNT + parent + 3 × {1 or 2 chunks for the M2M} + chained households_with_tool. Bounded by FR-009 absolute <= 10."
+    },
+    {
+      "id": "EC-007",
+      "title": "orderBy=random + paginationSeed",
+      "scenario": "add_order_by_to_query materializes all matching IDs to Python for the random shuffle (mealie/repos/repository_generic.py:436-449)",
+      "expected": "Adds 1 extra cursor execute (a 'fetch all IDs' step). Post-refactor count: 7. The regression test does NOT use orderBy=random to avoid this noise; if parametrized, ceiling becomes <= 10."
+    },
+    {
+      "id": "EC-008",
+      "title": "orderBy=lastMade or orderBy=rating",
+      "scenario": "User-correlated subqueries _get_last_made_col_alias / _get_rating_col_alias (FR-013) become part of the parent SELECT",
+      "expected": "Zero extra cursor executes per row. Chained selectinload for Tool.households_with_tool unaffected. Query count remains at FR-009 baseline. test_order_by_last_made and test_order_by_rating continue to pass (US-3)."
+    }
+  ],
+  "needs_clarification": [
+    {
+      "id": "NC-001",
+      "question": "Is `rating` a stored column or computed aggregate (per spec input listing it as a preserved response field)?",
+      "resolution": "Both. RecipeModel.rating is a scalar Float column (mealie/db/models/recipe/recipe.py:61). When by_user(user_id) is set (which the controller always does at recipe_crud_routes.py:370), column_aliases['rating'] returns _get_rating_col_alias (repository_recipes.py:72-93) — a sa.case(...) expression that prefers the user's UserToRecipe.rating if present and non-zero, else the recipe's scalar rating. This is a correlated scalar subquery on the parent SELECT — zero extra cursor executes. No batching or aggregate denormalization is required by the spec. FR-013 codifies this. The implementer should not introduce a new aggregate."
+    },
+    {
+      "id": "NC-002",
+      "question": "Does the refactor cover ONLY /api/recipes (input.md §1) or also /api/explore/groups/.../recipes and /organizers/categories/slug/{slug}?",
+      "resolution": "The seam (RecipeSummary.loader_options()) is shared by all callers of RepositoryRecipes.page_all and any other site that splats RecipeSummary.loader_options(). Fixing the seam transitively benefits all of them (FR-011). The regression test is scoped to /api/recipes per input.md §1; an additional sibling assertion for the explore endpoint is an optional follow-up captured in self_concerns SC-C. GET /api/users/{id}/favorites is NOT a shared consumer (uses UserRatingOut, not RecipeSummary) — api_perspective.md §8 confirms exclusion."
+    },
+    {
+      "id": "NC-003",
+      "question": "input.md:67-68 asserts count_large <= 5. The post-refactor minimum is 6 — is the spec ceiling infeasible?",
+      "resolution": "Yes — minimum is provably 6: 1 COUNT subquery + 1 parent SELECT (with the benign 1:1 joinedload(user)) + 3 selectinloads (recipe_category, tags, tools) + 1 chained selectinload (Tool.households_with_tool). Hitting <= 5 would require either dropping a field from the response (forbidden by FR-001) or moving the user.household_id proxy to a different mechanism (out of scope, would change call shape across the codebase). The spec ceiling is relaxed to <= 8 typical / <= 10 absolute (FR-009). The relative bound from input.md (count_large <= count_small + 3) is comfortably preserved."
+    },
+    {
+      "id": "NC-004",
+      "question": "input.md:23 lists slug_image as a required-to-preserve field. grep -rn 'slug_image' mealie/ returns zero hits.",
+      "resolution": "Treat as a typo in the spec input. The actual fields are slug (line 125) and image (line 126) on RecipeSummary. Both are preserved by FR-001. Drop slug_image from the required-fields list. Independently flagged by api_perspective.md §5, history_perspective.md §3 TL;DR #4, and ui_perspective.md §2.6."
+    },
+    {
+      "id": "NC-005",
+      "question": "input.md:13 lists 'recent comment counts' as an N+1 victim. RecipeSummary has no comments-related field.",
+      "resolution": "RecipeSummary.loader_options() (recipe.py:168-175) does NOT include RecipeModel.comments, and model_dump(by_alias=True) does not walk a non-existent attribute. No comments-related query is currently emitted by GET /api/recipes. Adding a comments_count field would violate FR-001 ('响应字段 100% 不变'). Treat the input phrase as illustrative of the historical N+1 class, not as a current symptom to fix. Independently flagged by api_perspective.md §5, history_perspective.md §3 TL;DR #4, and ui_perspective.md §1.5."
+    },
+    {
+      "id": "NC-006",
+      "question": "input.md:42-43 pseudo-code uses @pytest.mark.asyncio and async def. Mealie's test suite is fully synchronous.",
+      "resolution": "Write the test as plain sync def. Codified by FR-010. Evidence: mealie/db/db_setup.py:38 uses sa.create_engine(...) (sync engine), tests/conftest.py:45-46 exposes api_client as a starlette.testclient.TestClient (sync), pyproject.toml does not declare pytest-asyncio, and zero existing tests use async def (test_perspective.md §0)."
+    }
+  ],
+  "self_concerns": [
+    {
+      "id": "SC-A",
+      "concern": "Reviewers may not connect the fix to the literal N+1 framing",
+      "detail": "The data perspective identified Tool.households_with_tool lazy-load as the concrete N+1 root, but input.md frames the bug as generic 'tags/categories/tools/comments/image' (input.md:13). A reviewer reading only the input may wonder why the patch adds a chained selectinload(Tool.households_with_tool) instead of (or in addition to) a new comments_count loader.",
+      "mitigation": "The PR description should explicitly trace the N+1 from the RecipeTool.convert_households_to_slugs validator (schema/recipe/recipe.py:87-95) through the default-lazy Tool.households_with_tool relationship (db/models/recipe/tool.py:54-56) to the per-tool SQL fired during model_dump. Cite the prior art in RecipeToolOut.loader_options."
+    },
+    {
+      "id": "SC-B",
+      "concern": "Two adjacent loader_options sites retain the same anti-pattern AND lack the chained selectinload(Tool.households_with_tool)",
+      "detail": "mealie/schema/meal_plan/new_meal.py:67-74 (ReadPlanEntry.loader_options) and mealie/schema/household/group_shopping_list.py:202-208 (ShoppingListRecipeRefOut.loader_options) both hydrate RecipeSummary indirectly and exhibit the same N+1 risk on their respective endpoints. They are strictly out of input.md §1 scope.",
+      "mitigation": "List them as out-of-scope follow-ups in the PR description so a future iteration can fix them with the same one-line pattern."
+    },
+    {
+      "id": "SC-C",
+      "concern": "Query-count budget depends on SQLAlchemy IN-list chunking",
+      "detail": "SQLAlchemy 2.x's selectinload batches IN-list parameters at a default chunk size (currently 500). For perPage=-1 libraries > 500 recipes, each selectinload may split into 2 chunks → up to 3 extra statements (3 selectinloads + 1 chained), bringing the maximum to ~9.",
+      "mitigation": "Spec ceiling is <= 8 typical / <= 10 absolute (FR-009). The regression test parameters (perPage=50, then perPage=200) stay safely below the chunking threshold."
+    },
+    {
+      "id": "SC-D",
+      "concern": "task dev:generate reflex could trigger an unnecessary frontend types regeneration in CI",
+      "detail": "Frontend types (frontend/app/lib/api/types/recipe.ts) must be regenerated only if a Pydantic schema field changes; this refactor changes no Pydantic field, but reviewers/CI may expect a regeneration since the diff touches mealie/schema/recipe/recipe.py.",
+      "mitigation": "Explicitly note in the PR description that no Pydantic schema field set is changed and frontend/app/lib/api/types/recipe.ts is expected to be unchanged. This pre-empts reviewer confusion about why a 'schema-touching' PR doesn't ship a TS-types diff."
+    }
+  ],
+  "selected_approach_summary": {
+    "name": "Conservative",
+    "rationale": "Bug coverage is identical to Hybrid and complete; the 'batched subquery for counted fields' half of Hybrid is dead code (no counted fields in scope per K-3/K-7); Aggressive violates spec invariants in spirit; Conservative matches existing codebase idiom (RecipeToolOut, IngredientFood, Recipe loader_options all use the same chained-selectinload pattern); smallest blast radius (1 source file + 1 test file).",
+    "non_actions": [
+      "Does NOT modify RepositoryRecipes.page_all body — the seam is the schema's loader_options",
+      "Does NOT touch _get_rating_col_alias, _get_last_made_col_alias, or the column_aliases property (already correlated subqueries)",
+      "Does NOT remove .scalars().unique().all() at repository_recipes.py:280 (becomes no-op but cheap regression guard)",
+      "Does NOT add any new field to RecipeSummary (preserves '响应字段 100% 不变')",
+      "Does NOT add an alembic migration (all M2M secondary tables already indexed)",
+      "Does NOT patch the two adjacent loader sites (out of strict spec scope; captured as self_concerns SC-B)",
+      "Does NOT add an in-memory or Redis cache (input.md:79)",
+      "Does NOT use lazy='dynamic' or any 'hide-the-query' trick (input.md:82)"
+    ]
+  }
+}

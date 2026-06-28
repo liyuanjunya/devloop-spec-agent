@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0",
+  "primary": "Add a user-level Recipe favorite/star feature in Mealie: persist User-to-Recipe favorites, expose authenticated self-service favorite APIs, and extend Recipe responses with per-user favorited and public favorite_count while preserving group/household isolation.",
+  "intent_type": "add_feature",
+  "scope": ["backend", "data_model", "api", "repository", "service", "schemas", "migration", "i18n", "tests", "openapi"],
+  "excluded": [
+    {
+      "hypothesis_id": "H2",
+      "summary": "Add household-level favorite recipes shared by all Users in a Household.",
+      "exclusion_reason": "The input explicitly says the feature is user-level, not household-level; grounding says Recipe is owned by household but User belongs under household, so favorites should be keyed by user_id."
+    },
+    {
+      "hypothesis_id": "H3",
+      "summary": "Only add API endpoints for a favorites list without modifying existing Recipe list/detail responses.",
+      "exclusion_reason": "The spec explicitly requires GET /api/recipes and GET /api/recipes/{slug} to return favorited and favorite_count, and highlights this dual requirement in the evaluation notes."
+    },
+    {
+      "hypothesis_id": "H4",
+      "summary": "Implement a frontend UI for recipe favorites.",
+      "exclusion_reason": "The requested changes and skeleton focus on backend FastAPI routes, services, repositories, schemas, migrations, i18n, and tests; the skeleton marks frontend as out of scope for this case."
+    },
+    {
+      "hypothesis_id": "H5",
+      "summary": "Add a general Recipe popularity/like system independent of User identity and access control.",
+      "exclusion_reason": "The data model is explicitly user_favorite_recipe with user_id and recipe_id, authenticated self endpoints, per-current-user favorited, idempotent add/remove, and cross group/household visibility constraints."
+    }
+  ],
+  "pending_clarification": [],
+  "confidence": 0.96,
+  "rounds_used": 1
+}

@@ -1,0 +1,144 @@
+{
+  "schema_version": "1.0",
+  "summary": "Mealie already appears to have user-recipe favorite concepts in both backend and frontend: explorers reported UserToRecipe.is_favorite, existing /users/{id}/favorites/{slug} endpoints, a RecipeFavoriteBadge.vue, and a user favorites page. The requested input describes a new user_favorite_recipe table and new authenticated self endpoints, so the spec must decide whether to refactor existing behavior, add compatibility wrappers, or intentionally create a replacement system.",
+  "conflicts": [
+    {
+      "perspectives_involved": [
+        "data",
+        "api",
+        "ui",
+        "input"
+      ],
+      "description": "Greenfield request conflicts with existing backend/frontend favorites code: requested new table and self endpoints vs reported UserToRecipe.is_favorite, /users/{id}/favorites/{slug}, favorite badge, and favorites page.",
+      "resolution_suggestion": "Treat as refactor/extension unless inspection proves otherwise; choose reuse, compatibility wrapper, or explicit replacement with migration/backfill."
+    },
+    {
+      "perspectives_involved": [
+        "data",
+        "input"
+      ],
+      "description": "Persistence model conflict: existing UserToRecipe.is_favorite boolean association vs requested dedicated user_favorite_recipe join table.",
+      "resolution_suggestion": "Decide canonical storage; either keep existing field, migrate/backfill to new table, or temporarily support both with consistency tests."
+    },
+    {
+      "perspectives_involved": [
+        "api",
+        "ui",
+        "input"
+      ],
+      "description": "API path conflict: existing/UI paths appear user-id based (/users/{id}/favorites/{slug}) while input requires current-user self paths (/api/users/self/favorites/{recipe_slug}).",
+      "resolution_suggestion": "Define canonical path and compatibility/deprecation behavior; update frontend client or preserve aliases."
+    },
+    {
+      "perspectives_involved": [
+        "history",
+        "data",
+        "api",
+        "ui"
+      ],
+      "description": "History perspective labels the feature greenfield because commit-grep found no favorite implementation, but static/UI findings indicate existing code.",
+      "resolution_suggestion": "Trust current code inspection for existence; use history only for migration/test conventions."
+    },
+    {
+      "perspectives_involved": [
+        "ui",
+        "intent",
+        "api"
+      ],
+      "description": "Confirmed scope excludes frontend, but existing frontend likely calls favorite APIs and may break if backend paths/schema change without compatibility.",
+      "resolution_suggestion": "Keep backend-only scope with compatibility tests, or add minimal client/type regeneration or a follow-up UI task."
+    }
+  ],
+  "consolidated_artifacts": [
+    {
+      "path": "mealie/db/models/**/UserToRecipe*",
+      "importance": "critical",
+      "reason": "Existing backend association/model reportedly contains is_favorite; inspect before adding or replacing user_favorite_recipe."
+    },
+    {
+      "path": "mealie/routes/users/**",
+      "importance": "critical",
+      "reason": "Existing user favorite endpoints reportedly include /users/{id}/favorites/{slug}; conflicts with requested self endpoint contract."
+    },
+    {
+      "path": "frontend/app/lib/api/user/users.ts",
+      "importance": "critical",
+      "reason": "Existing frontend user API client already has favorite endpoints; requires compatibility or migration decision."
+    },
+    {
+      "path": "frontend/app/components/Domain/Recipe/RecipeFavoriteBadge.vue",
+      "importance": "critical",
+      "reason": "Existing heart/favorite toggle UI means favorites are not purely greenfield."
+    },
+    {
+      "path": "frontend/app/pages/user/[id]/favorites.vue",
+      "importance": "critical",
+      "reason": "Existing user favorites page likely depends on old endpoint semantics."
+    },
+    {
+      "path": "mealie/schema/recipe/**",
+      "importance": "critical",
+      "reason": "Recipe responses must add favorited and favorite_count while preserving anonymous behavior."
+    },
+    {
+      "path": "mealie/routes/recipe/recipe_crud_routes.py",
+      "importance": "critical",
+      "reason": "Recipe list/detail routes must expose favorite fields and avoid N+1 query behavior."
+    },
+    {
+      "path": "mealie/services/recipe/recipe_service.py",
+      "importance": "critical",
+      "reason": "Likely service touch point for current-user favorite state and aggregate favorite counts."
+    },
+    {
+      "path": "tests/integration_tests/**",
+      "importance": "critical",
+      "reason": "Required coverage for idempotency, anonymous behavior, cross-group 404, count, cascade cleanup, and pagination."
+    },
+    {
+      "path": "tests/multitenant_tests/**",
+      "importance": "critical",
+      "reason": "Required coverage for household/group isolation."
+    },
+    {
+      "path": "mealie/alembic/versions/",
+      "importance": "relevant",
+      "reason": "Migration location and naming convention if new table/backfill is chosen."
+    },
+    {
+      "path": "mealie/repos/repository_users.py",
+      "importance": "relevant",
+      "reason": "Input suggests this as repository layer for user favorite operations."
+    },
+    {
+      "path": "mealie/repos/repository_favorites.py",
+      "importance": "relevant",
+      "reason": "Possible new repository if dedicated favorite table is chosen."
+    },
+    {
+      "path": "mealie/schema/user/user_favorites.py",
+      "importance": "relevant",
+      "reason": "Requested Pydantic schema location for self favorites API."
+    },
+    {
+      "path": "frontend/app/lib/api/types/",
+      "importance": "relevant",
+      "reason": "Generated API types; do not edit manually if frontend contract changes."
+    },
+    {
+      "path": "lang/messages/*.yaml",
+      "importance": "relevant",
+      "reason": "Use Mealie i18n for errors instead of hard-coded English."
+    }
+  ],
+  "consolidated_conventions": [
+    "New table-backed features typically ship migration, DB model, repository, route/controller, schema, and integration/unit tests together in one PR.",
+    "Alembic migration filenames use YYYY-MM-DD-HH.MM.SS_<revision_hash>_<snake_case_desc>.py.",
+    "Household/group isolation should be enforced in service/query logic and proven in integration or multitenant tests.",
+    "User-facing errors should use Mealie i18n message files instead of hard-coded English.",
+    "Pydantic/OpenAPI schemas and response_model definitions should be complete for FastAPI OpenAPI generation.",
+    "Recipe list enrichment must avoid N+1 by using joins, IN, aggregate subqueries, or EXISTS.",
+    "Frontend API types are generated via task dev:generate; do not manually edit frontend/app/lib/api/types/.",
+    "Frontend API clients live under frontend/app/lib/api/ and extend BaseAPI / BaseCRUDAPI."
+  ]
+}

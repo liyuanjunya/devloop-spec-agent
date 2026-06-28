@@ -1,0 +1,119 @@
+{
+  "schema_version": "1.0",
+  "primary": "Add an opt-in per-household scheduled job (plus a manual admin trigger endpoint) that, once per household-local day, consolidates today's MealPlan recipes' ingredients (excluding pantry staples) and appends them to the household's configured target shopping list, dispatching a MealPlanAutoSyncedToShopping event. Includes new HouseholdPreferences fields (auto_sync_meal_plan_to_shopping, auto_sync_target_shopping_list_id, auto_sync_run_time, LastAutoSyncedAt), a new IngredientFood.is_pantry_staple column, a new EventTypes member, i18n error strings, and unit/integration/multitenant tests. Reuses mealie/services/scheduler/, mealie/services/household_services/shopping_lists.py (merge_items/add_recipe_ingredients_to_list), and mealie/services/event_bus_service/. Multi-replica safe via DB row-level lock or LastAutoSyncedAt CAS; household-timezone aware (no naive datetime.now()).",
+  "intent_type": "add_feature",
+  "scope": ["backend", "data_model", "api", "test", "infra", "docs"],
+  "confidence": 0.95,
+  "hypotheses": [
+    {
+      "id": "H1",
+      "summary": "add_feature: introduce a new opt-in per-household auto-sync vertical (config fields + scheduled task + manual trigger + event + pantry-staple flag) on top of existing scheduler / shopping-list / event-bus abstractions.",
+      "indicators": [
+        "input.md section '功能需求' enumerates 5 explicit sub-requirements all of which are net-new (新增 Household 配置, 定时任务实现, 手动触发接口, 跨域配套, 测试要求).",
+        "Spec explicitly says '新增定时任务' in mealie/services/scheduler/tasks/auto_sync_shopping.py — a file that does NOT exist in the repo (verified via Get-ChildItem of tasks/).",
+        "Spec explicitly says '新增 PATCH /api/households/preferences 字段支持' and '新增 POST /api/households/preferences/auto-sync-shopping/run-now' — new API surface, not modifications to existing endpoints.",
+        "Spec explicitly says 'Food 模型新增 is_pantry_staple' — verified absent from mealie/db/models/recipe/ingredient.py IngredientFoodModel (lines 153-260).",
+        "Spec explicitly says '派发事件 MealPlanAutoSyncedToShopping' — verified absent from EventTypes enum in mealie/services/event_bus_service/event_types.py:13.",
+        "Spec explicitly says '新增错误码 auto-sync.*' — new i18n strings, not changes to existing ones.",
+        "'实现约束' section uses the word '复用' (reuse) for scheduler/shopping_lists/event_bus, confirming infrastructure is consumed as-is, not refactored.",
+        "Expected file count '~12-18 个文件' matches the surface area of a single cohesive feature spanning model+migration+schema+repo+service+route+event+i18n+tests."
+      ],
+      "counter_indicators": [
+        "Could be argued as 4 micro-features (config / scheduler / endpoint / event); resolved by skeptic challenge SK1.",
+        "Spec references 'consolidate_ingredients' and '@scheduled' decorator which do not exist verbatim in the codebase — these are spec-side terminology drift, not evidence against add_feature; mealie uses inline consolidation in shopping_lists.py (merge_items, line 73; add_recipe_ingredients_to_list, line 413) and SchedulerRegistry.register_daily/hourly/minutely callbacks (scheduler_registry.py:13-15) with ScheduledFunc dataclass (scheduled_func.py:8)."
+      ],
+      "verdict": "primary"
+    },
+    {
+      "id": "H2",
+      "summary": "refactor: extract a reusable auto-sync / consolidation abstraction from the existing shopping_lists service and scheduler tasks.",
+      "indicators": [
+        "Spec mentions 'consolidate_ingredients (合并函数, 复用 case-3 中可能被修复的逻辑)' which could hint at consolidating duplicated merge logic.",
+        "Existing shopping_lists.py has multiple places that 'consolidate items to be created' (lines 162, 226) which is repeated code smell — a tempting refactor target."
+      ],
+      "counter_indicators": [
+        "Spec never asks to change the signature, location, or behavior of existing shopping-list merge code — only to '复用' (consume) it.",
+        "No 'before/after' contract or deprecation notice in spec; refactors typically demand behavior preservation guarantees, which are absent here.",
+        "All deliverables (preferences fields, scheduled task file, endpoint, event, food column, i18n strings, tests) are net-new artifacts, not relocations of existing ones.",
+        "Acceptance criteria (multitenant isolation, idempotency, timezone) are stated as new constraints on the new task, not as regression guards on refactored code."
+      ],
+      "verdict": "rejected"
+    },
+    {
+      "id": "H3",
+      "summary": "perf_opt: optimize shopping-list consolidation/aggregation to handle scheduled bulk insertion at scale.",
+      "indicators": [
+        "Spec mentions '多副本部署' (multi-replica deployment) which is operationally adjacent to performance.",
+        "Bulk merge operation across all households at a 30-minute cadence has implicit throughput implications."
+      ],
+      "counter_indicators": [
+        "Zero performance SLO, benchmark target, or 'before/after latency' figure in input.md.",
+        "Multi-replica concern in spec is framed as correctness (avoid duplicate execution via row-level lock / LastAutoSyncedAt CAS), not throughput optimization.",
+        "Spec '实现约束' calls for reuse of existing merge functions, which would be the opposite ask of a perf rewrite.",
+        "Aggregation cost is bounded by 'today's meal plan entries for one household' — small N, no scaling motivation."
+      ],
+      "verdict": "rejected"
+    }
+  ],
+  "skeptic_challenges": [
+    {
+      "challenge": "SK1 — This could be decomposed into 4 independent features (HouseholdPreferences fields, scheduled task, manual endpoint, new event type). Why treat it as one add_feature?",
+      "resolution": "The four pieces are coupled by a single user-visible capability ('auto-sync today's meal plan into my shopping list'). Removing any one piece (e.g., shipping config without the scheduled task, or the task without the manual trigger) yields no end-user value and violates the spec's acceptance criteria ('当天无 meal plan 时返回 204 / 0 added' presumes the trigger endpoint; '配置未开启时定时任务跳过' presumes the config field). Treat as one feature with 6 sub-requirements per the spec's own '三环节考察点' table."
+    },
+    {
+      "challenge": "SK2 — IngredientFood.is_pantry_staple is a cross-cutting data-model change that affects admin/foods routes for any operator who wants to mark staples. Is this really part of the same feature, or a separate add_feature?",
+      "resolution": "Spec explicitly tags it as '跨域配套' (cross-cutting support) for the auto-sync filter step #4 ('如果 food.is_pantry_staple = true 则跳过'). The flag has no user-visible behavior outside the auto-sync filter context. Ship together; otherwise the auto-sync test 'pantry staples 不被同步' cannot pass."
+    },
+    {
+      "challenge": "SK3 — The i18n strings (auto-sync.*) and the alembic migration are arguably docs and infra concerns, not feature work. Should scope omit them?",
+      "resolution": "The restricted scope vocabulary forces 'docs' for i18n YAML and 'infra' for scheduler registration/multi-replica concerns. Both are required deliverables for acceptance — omitting them means error responses are hardcoded English and the task is unrunnable in a 2-pod deployment. Keep in scope."
+    },
+    {
+      "challenge": "SK4 — Spec references '@scheduled' decorator and 'consolidate_ingredients' function that do not exist in the repo. Is the spec hallucinating the codebase, casting doubt on the whole intent?",
+      "resolution": "Verified actual codebase has equivalent abstractions under slightly different names: SchedulerRegistry.register_daily/hourly/minutely (scheduler_registry.py:24-39) + ScheduledFunc dataclass (scheduled_func.py:8); consolidation logic exists inline inside shopping_lists.py merge_items (line 73), bulk_create_items 'consolidate items to be created' loop (line 162-177), and add_recipe_ingredients_to_list (line 413). Intent is unaffected — implementation phase will bind to the actual names; this is a spec-side terminology drift to flag for the design agent, not an intent ambiguity."
+    },
+    {
+      "challenge": "SK5 — The spec's '每 30 分钟' (every 30 minutes) cadence has no direct match: SchedulerRegistry only exposes daily/hourly/minutely buckets. Is the requirement infeasible (changing the intent classification)?",
+      "resolution": "Feasible without changing intent: either (a) register on the minutely bucket and have the callback self-throttle (skip if minute % 30 != 0), or (b) extend SchedulerRegistry with a new 'every_30_min' bucket. Both are implementation choices inside add_feature scope. Does not promote this to refactor."
+    },
+    {
+      "challenge": "SK6 — Could '禁止使用 datetime.now() without timezone' suggest a global codebase audit (cross-cutting refactor) rather than a feature?",
+      "resolution": "Constraint is scoped to the new auto-sync code path ('时区: 必须使用 household 配置的时区'). It's a local correctness rule for the new task, not a repo-wide cleanup mandate. Stays within add_feature."
+    }
+  ],
+  "verifications": [
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/scheduler/tasks/__init__.py:1 — directory exists with sibling tasks (purge_expired_share_tokens.py, post_webhooks.py, delete_old_checked_shopping_list_items.py); auto_sync_shopping.py does NOT exist (verified by Get-ChildItem -Recurse), confirming the spec's '新增' (add new) instruction."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/db/models/household/preferences.py:16-44 — HouseholdPreferencesModel exists as a simple flat ORM with bool/int columns and @auto_init(); cleanly extensible with new auto_sync_* columns and last_auto_synced_at timestamp."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/db/models/recipe/ingredient.py:153-260 — IngredientFoodModel (the 'Food' entity) has no is_pantry_staple column; safe to add via alembic migration alongside existing bool columns."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/event_bus_service/event_types.py:13 — EventTypes(Enum) exists; meal_plan_auto_synced_to_shopping is absent, confirming new enum member is needed. EventShoppingListData/EventShoppingListItemData at lines 130-141 provide the payload schema pattern."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/household_services/shopping_lists.py:73 (merge_items), :162-177 (consolidated_create_items loop), :413 (add_recipe_ingredients_to_list) — reusable merge/append entry points exist exactly where the spec says they should be reused."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/scheduler/scheduler_registry.py:13-39 — SchedulerRegistry with _daily/_hourly/_minutely buckets and register_daily/register_hourly/register_minutely staticmethods is the actual registration mechanism (spec's '@scheduled decorator' is terminology drift; same goal achieved via SchedulerRegistry.register_minutely + ScheduledFunc dataclass at scheduled_func.py:8)."
+    },
+    {
+      "hypothesis": "H2",
+      "evidence": "Counter-evidence: searched input.md for '重构' or '抽离' or 'extract' or 'refactor' — zero hits. Every '新增'/'修改' verb is paired with a new artifact, never with replacing an existing one. Rejects refactor framing."
+    },
+    {
+      "hypothesis": "H3",
+      "evidence": "Counter-evidence: searched input.md for 'perf'/'latency'/'p95'/'throughput'/'benchmark'/'优化' — zero perf-keyword hits. Multi-replica concern at line 82 explicitly tied to correctness ('保证同一 household 同一天只被一个 worker 处理'), not throughput. Rejects perf_opt framing."
+    }
+  ],
+  "rounds_used": 1
+}

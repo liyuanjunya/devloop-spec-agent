@@ -1,0 +1,136 @@
+{
+  "schema_version": "1.0",
+  "primary": "Add a Shopping List Archive feature to Mealie: extend the existing ShoppingList entity with archived_at + archived_by_user_id, add archive/unarchive endpoints, default-filter archived lists out of the main list view, enforce a 409 'frozen' state on all mutating list/item endpoints once archived, scope visibility to the owning household, and emit ShoppingListArchived / ShoppingListUnarchived events on the existing event bus.",
+  "intent_type": "add_feature",
+  "scope": [
+    "data_model",
+    "api",
+    "service",
+    "repo",
+    "multitenant",
+    "i18n",
+    "event_bus",
+    "tests"
+  ],
+  "confidence": 0.92,
+  "hypotheses": [
+    {
+      "id": "H1",
+      "summary": "add_feature: end-to-end Shopping List Archive feature (data model + API + state-machine + events + tests + i18n)",
+      "indicators": [
+        "Spec section 1 requires two new columns on ShoppingList (archived_at TIMESTAMP NULL, archived_by_user_id UUID NULL FK→users.id) — pure data model extension alone would not justify everything else.",
+        "Spec sections 2–3 add new POST /archive and /unarchive endpoints and impose a 409 'frozen' state across 4 existing endpoints (PUT list, POST item, PUT item, DELETE item), i.e. a new state machine on the entity.",
+        "Spec section 5 requires new event-bus event types ShoppingListArchived / ShoppingListUnarchived with a richer payload (list_name, household_id, archived_by_user_id, item_count, total_estimated_amount) — the existing EventShoppingListData only carries shopping_list_id (mealie/services/event_bus_service/event_types.py:130-132), so this requires extending the event-type enum and payload schema.",
+        "Spec section 6 changes GET /shopping/lists response shape conditionally (?archived=true/all attaches archived_at + archived_by user summary), requiring Pydantic schema additions on ShoppingListSummary / ShoppingListOut and repository-level query branching.",
+        "Spec section 7 explicitly mandates centralising filter logic in repository_shopping (currently repository_shopping_list.py is a trivial 12-line subclass — mealie/repos/repository_shopping_list.py:1-12), which is a service/repo layer addition.",
+        "Spec section 8 demands multitenant_tests + integration_tests + unit_tests, signalling user-facing behaviour change rather than internal refactor."
+      ],
+      "counter_indicators": [
+        "No new SQLAlchemy table is created — only two columns on an existing table. Could be argued as 'data_model_extension' instead.",
+        "No new domain entity (e.g. no ArchiveLog table) is introduced.",
+        "Multi-tenancy is not being extended — the spec only re-asserts the existing group/household isolation guarantees that already apply to ShoppingList via association_proxy('user', 'household_id') in mealie/db/models/household/shopping_list.py:153."
+      ],
+      "verdict": "primary"
+    },
+    {
+      "id": "H2",
+      "summary": "data_model_extension: pure column addition with backwards-compatible migration; downstream API/event changes are incidental glue",
+      "indicators": [
+        "Two new nullable columns on ShoppingList (archived_at, archived_by_user_id).",
+        "Alembic migration with batch_alter_table.add_column nullable=True pattern matches the existing 'add referenced_recipe' migration (mealie/alembic/versions/2025-09-10-19.21.48_1d9a002d7234_add_referenced_recipe_to_ingredients.py:22-28).",
+        "Schema additions are optional / default-None to remain backward compatible (Spec §6: '默认查询不返回这些字段（保持向后兼容）')."
+      ],
+      "counter_indicators": [
+        "Spec mandates THREE net-new API verbs (POST /archive, POST /unarchive, GET ?archived=…), plus 409 frozen behaviour on 4 existing endpoints — far beyond a pure column addition.",
+        "New event bus event types (ShoppingListArchived/Unarchived) require modifying the EventTypes enum (mealie/services/event_bus_service/event_types.py:13-60), which per its own docstring 'likely requires a database migration' for the subscriber repository — non-trivial cross-cutting change.",
+        "New i18n keys (shopping-list.archive.unchecked-items, shopping-list.archived.frozen) need to be added to lang/messages/en-US.json which currently has no shopping-list namespace (verified via Get-Content over en-US.json)."
+      ],
+      "verdict": "secondary"
+    },
+    {
+      "id": "H3",
+      "summary": "state_machine_extension: introduce active/archived state with frozen-state semantics on an existing entity (column additions are implementation detail)",
+      "indicators": [
+        "Spec §3 'archived 后的不可变性' is the dominant business semantics: archived list rejects PUT/POST/DELETE on itself and its items with 409 + shopping-list.archived.frozen.",
+        "Spec §2 'unarchive' explicit exception is classic state-machine guard — only this transition is allowed while in the archived state.",
+        "Spec §1 'archived_at IS NULL ⇒ archived_by_user_id MUST be NULL' is a state invariant (mutually-coupled fields)."
+      ],
+      "counter_indicators": [
+        "No state-column enum is introduced; archived state is derived from archived_at IS NOT NULL — Mealie tends to use boolean/timestamp flags rather than explicit state machines (e.g. ShoppingListItem.checked at shopping_list.py:65).",
+        "User-facing framing in the input.md is 'archive feature' not 'add state machine'.",
+        "Subsumed by H1 (add_feature) — the frozen-state semantics is one slice of the feature, not the feature itself."
+      ],
+      "verdict": "secondary"
+    },
+    {
+      "id": "H4",
+      "summary": "multitenant_extension: the spec is fundamentally about cross-tenant isolation guarantees for archived lists",
+      "indicators": [
+        "Spec §4 explicitly enumerates household-vs-group isolation and Spec §8 demands multitenant_tests."
+      ],
+      "counter_indicators": [
+        "The isolation guarantees are already provided by the existing HouseholdRepositoryGeneric._filter_builder (mealie/repos/repository_generic.py:94-102) which auto-injects household_id+group_id filters on every query.",
+        "Spec §4 is a regression-prevention requirement (i.e. 'don't break existing isolation while adding archive'), not a tenancy model extension. No change to Group/Household model.",
+        "Event-bus dispatch already loops per-household (mealie/services/event_bus_service/event_bus_service.py:82-96) so cross-household leakage is structurally prevented; the spec is asking us to maintain that invariant for the new payload."
+      ],
+      "verdict": "rejected"
+    }
+  ],
+  "skeptic_challenges": [
+    {
+      "challenge": "Is ShoppingList.household_id really filterable at the SQL level? It's an association_proxy through user (mealie/db/models/household/shopping_list.py:153), not a direct column — does HouseholdRepositoryGeneric.page_all actually scope correctly for the archived filter?",
+      "resolution": "Verified: RepositoryGeneric._query at mealie/repos/repository_generic.py:79-92 has explicit handling for AssociationProxyInstance on model.household_id (lines 83-86), and _filter_builder (lines 94-102) injects household_id into filter_by(**fltr) which SQLAlchemy resolves through the user join. The existing flow at services/household_services/shopping_lists.py:186 (PaginationQuery query_filter) already mixes column filters with household scoping. Therefore: the new ?archived=… filter must be applied via _query/_filter_builder on the archived_at column directly (which IS a real column), and household isolation continues to work through the existing user-join machinery."
+    },
+    {
+      "challenge": "Does adding ShoppingListArchived / ShoppingListUnarchived event types really need a DB migration? The spec doesn't mention one.",
+      "resolution": "Verified: mealie/services/event_bus_service/event_types.py:13-22 docstring states 'Each event type is represented by a field on the subscriber repository, therefore any changes made here must also be reflected in the database (and likely requires a database migration).' This means the alembic migration in the feature must (a) add archived_at + archived_by_user_id columns to shopping_lists AND (b) add boolean subscription-flag columns to GroupEventNotifierModel for the two new event types. Precedent: 2026-03-26-20.48.28_cdc93edaf73d_add_mealplan_updated_and_deleted_to_.py listed in the alembic versions directory."
+    },
+    {
+      "challenge": "Could the 409 'frozen' check live in the controller layer instead of service/repo, since that's simpler?",
+      "resolution": "Per the user input §7 'implementation constraints', the check MUST be implemented centrally in repository_shopping and reuse mealie/services/household_services/shopping_lists.py. Verified the service file exists and is 22.7KB / 555 lines, with bulk_create_items / bulk_update_items / bulk_delete_items methods at lines 154-321 that are the correct interception points. Controller-level checks are explicitly disallowed."
+    },
+    {
+      "challenge": "The grounding document says lang files are YAML at lang/messages/ but the input asks to add an i18n key — is the format correct?",
+      "resolution": "Verified: Get-ChildItem on lang/messages/ shows .json files (af-ZA.json, ar-SA.json, …, en-US.json). Grounding §5 is wrong — files are JSON, not YAML. en-US.json verified to have nested kebab-case keys (e.g. 'recipe.unique-name-error', 'notifications.generic-created'); no existing 'shopping-list' top-level key, so it must be added. Only en-US should be modified per .github/copilot-instructions.md (Crowdin manages the rest)."
+    },
+    {
+      "challenge": "Should the unarchive endpoint also check anything about item state (e.g. items may have been externally deleted)?",
+      "resolution": "Spec §2 is silent on this; the table in the input only lists 'unarchive: 取消归档 / 内成员' with no item-state preconditions. The Code Review section (§90-96) calls this out as a CR-stage concern: 'unarchive 时若 items 已被外部清理如何处理'. Therefore implementation should simply clear archived_at + archived_by_user_id without item-state checks, and the question gets surfaced during CR. Not a primary-intent blocker."
+    }
+  ],
+  "verifications": [
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/db/models/household/shopping_list.py:147-181 — ShoppingList model has id, group_id (direct FK), user_id (direct FK to users.id), household_id (association_proxy via user), name, list_items[], recipe_references[], label_settings[], extras[]. No archived_at / archived_by_user_id present, confirming this is a column addition."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/db/models/household/shopping_list.py:65 — ShoppingListItem.checked: FilterableColumn[bool | None] = mapped_column(Boolean, default=False). The archive precondition 'all items checked=true' maps directly to this existing column."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/routes/households/controller_shopping_lists.py:156-272 — ShoppingListController exposes get_all (line 176), create_one (186), get_one (200), update_one (204), delete_one (217), plus label-settings/recipe-add helpers (234-283). Archive/unarchive routes must be added inside this controller, and update_one needs the frozen-state guard. The item controller (lines 98-153) at create_one/update_one/delete_one needs the same guard."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/repos/repository_shopping_list.py:1-12 — current file is a 12-line trivial subclass of HouseholdRepositoryGeneric[ShoppingListOut, ShoppingList] with only an override of `update`. This is the file the spec calls 'repository_shopping.py' (grounding/spec naming drift). It is the correct hook for the centralised archive filter logic per spec §7."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/event_bus_service/event_types.py:13-60 (EventTypes enum) currently has shopping_list_created / shopping_list_updated / shopping_list_deleted (lines 42-44) but no archived/unarchived variants. The docstring lines 17-22 mandates a DB migration when adding new event types, confirming this slice of the work."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/lang/messages/en-US.json:1-95 (verified full file is 95 lines / 4109 bytes) — top-level keys: generic, recipe, mealplan, user, group, exceptions, notifications, datetime, emails. No shopping-list namespace exists; the new keys (shopping-list.archive.unchecked-items, shopping-list.archived.frozen) need to be added as a new top-level branch."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/alembic/versions/2025-09-10-19.21.48_1d9a002d7234_add_referenced_recipe_to_ingredients.py:21-28 — establishes the exact pattern for the upcoming archive migration: with op.batch_alter_table(table) as batch_op: batch_op.add_column(sa.Column(name, mealie.db.migration_types.GUID(), nullable=True)); batch_op.create_index(...); batch_op.create_foreign_key(...)."
+    },
+    {
+      "hypothesis": "H2",
+      "evidence": "mealie/db/models/recipe/recipe.py:147 — `last_made: FilterableColumn[datetime | None] = mapped_column(NaiveDateTime)` is the existing nullable-timestamp precedent for archived_at. NaiveDateTime is imported from mealie/db/models/_model_utils/datetime.py:20-50."
+    }
+  ],
+  "rounds_used": 1
+}

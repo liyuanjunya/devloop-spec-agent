@@ -1,0 +1,8 @@
+{
+  "description": "Fix the get_product endpoint to actually return a product instead of 404",
+  "repo": "tests/fixtures/sample_repo",
+  "tags": ["fix_bug", "api"],
+  "min_fr_count": 1,
+  "min_user_stories": 1,
+  "expected_intent_type": "fix_bug"
+}

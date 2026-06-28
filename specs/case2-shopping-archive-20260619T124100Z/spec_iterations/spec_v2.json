@@ -1,0 +1,687 @@
+{
+  "schema_version": "1.0",
+  "case_id": "case2-shopping-archive-20260619T124100Z",
+  "feature_name": "Shopping List Archive",
+  "intent_type": "add_feature",
+  "metadata": {
+    "iterations": 2,
+    "generated_at": "2026-06-19",
+    "repo_root": "C:\\Users\\v-liyuanjun\\Downloads\\mealie",
+    "repo_commit": "4a099c16",
+    "selected_approach_doc": "approach/selected.md",
+    "input_source": "input.md §1-§8",
+    "supersedes": "spec.md / spec.json (v1)",
+    "resolves": [
+      "review_v1_architecture.md C1, H1, H2, M1, M2",
+      "review_v1_completeness.md COMP-C-001 (rejected), COMP-C-002, COMP-C-003 (rejected), COMP-H-001, COMP-H-002, COMP-H-003",
+      "review_v1_consistency.md C-001, C-002, C-003, C-004, C-005, C-006, C-007",
+      "review_v1_executability.md path corrections + ambiguity findings"
+    ]
+  },
+  "primary_summary": "Add an archive lifecycle to Mealie's ShoppingList entity: extend with archived_at + archived_by_user_id columns (FK ON DELETE SET NULL); new POST /archive and /unarchive endpoints; default GET filters archived lists out; ?archived=true|all reveals them; archived lists become immutable for EVERY list-mutating route (PUT list / POST item / PUT item / DELETE item / PUT label-settings / POST recipe / DELETE recipe all return 409 with i18n key shopping-list.archived.frozen); defense in depth uses repository-layer guard PLUS service-layer pre-flight for the routes that bypass the repo guard; HTTP/i18n translation lives in a global FastAPI exception handler in mealie/routes/handlers.py (services stay HTTP-free); emit ShoppingListArchived/Unarchived events ONLY on actual state transition (unarchive on already-active list is a no-op without event); event payload uses input's exact field names list_id/list_name; multitenant isolation via existing HouseholdRepositoryGeneric scoping plus tenant-scoped WHERE clauses on archive/unarchive writes; centralised in mealie/repos/repository_shopping_list.py per input §7.",
+  "selected_approach": {
+    "name": "Soft delete + repository-level frozen guard + service-level pre-flight (Group B)",
+    "rationale": "Selected per input §7 mandate 'centralised in repository_shopping_list.py'. Places default-exclude filter AND frozen-state guard in the repository layer for all routes that write through RepositoryShoppingList.update or RepositoryShoppingListItem.{create,update,delete}_many. Routes that bypass these methods (label-settings via shopping_list_multi_purpose_labels.update_many; recipe-add/remove via add_recipe_ingredients_to_list) get an explicit service-layer pre-flight check (ensure_list_not_archived) before any write. Repos raise typed Python exception ShoppingListIsArchivedError (no HTTP/i18n concerns); a global FastAPI exception handler in mealie/routes/handlers.py translates to HTTPException(409, ErrorResponse.respond(message=translator.t('shopping-list.archived.frozen'))). Existing RepositoryShoppingList.update override (lines 9-11) is the natural seam, expanded from passthrough into guarded passthrough.",
+    "candidates_considered": [
+      "A. Soft delete (filter only, no guard) — rejected: violates input §3.",
+      "B. Soft delete + service-level guard — strong alternative but does not match input §7's 'centralised' wording as literally as Option C.",
+      "C. Soft delete + repository-level guard + service-level pre-flight — SELECTED (v2 adds the service-level pre-flight to close the Group B gap)."
+    ],
+    "documents": {
+      "candidates": "approach/candidates.md",
+      "selected": "approach/selected.md"
+    }
+  },
+  "user_stories": [
+    {
+      "id": "US-1",
+      "priority": "P1",
+      "title": "Archive a shopping list (success path)",
+      "as_a": "household member",
+      "i_want": "to mark a fully-completed shopping list as archived",
+      "so_that": "the main shopping-list view stays uncluttered and I retain historical records",
+      "acceptance": "Given I am a member of household H1 and ShoppingList L1 has household_id == H1 and all items checked, when I POST /api/households/shopping/lists/{L1.id}/archive, then response is 200 OK with ShoppingListOut where archived_at is the current UTC timestamp and archived_by is my UserSummary; the row is persisted with archived_at IS NOT NULL and archived_by_user_id = me.id; one EventTypes.shopping_list_archived event is dispatched with EventShoppingListArchiveData payload."
+    },
+    {
+      "id": "US-2",
+      "priority": "P1",
+      "title": "Archive blocked when unchecked items present",
+      "as_a": "household member",
+      "i_want": "the system to refuse to archive a list that still has unchecked items",
+      "so_that": "I don't accidentally lose track of in-progress purchases",
+      "acceptance": "Given ShoppingList L1 has any item with checked == None or checked == False, when I POST /api/households/shopping/lists/{L1.id}/archive, then response is 409 CONFLICT with detail.message == 'Cannot archive a shopping list while items remain unchecked' (en-US value of shopping-list.archive.unchecked-items); the row is unchanged; no event is dispatched."
+    },
+    {
+      "id": "US-3",
+      "priority": "P1",
+      "title": "Default GET filters archived lists out",
+      "as_a": "household member",
+      "i_want": "the default shopping-lists view to show only active lists",
+      "so_that": "I see a clean current working set",
+      "acceptance": "Given household H1 contains L_active and L_archived, when I GET /api/households/shopping/lists, then response items contains L_active.id and not L_archived.id; total reflects active-only count."
+    },
+    {
+      "id": "US-4",
+      "priority": "P1",
+      "title": "?archived=true and ?archived=all reveal archive history",
+      "as_a": "household member",
+      "i_want": "explicit query parameters to view archived-only or all lists",
+      "so_that": "I can review history without polluting the default view",
+      "acceptance": "GET /api/households/shopping/lists?archived=true returns only archived lists with archived_at + archived_by populated; ?archived=all returns both active (archived_at: null, archived_by: null) and archived lists."
+    },
+    {
+      "id": "US-5",
+      "priority": "P1",
+      "title": "Frozen-state: every list-mutating route returns 409",
+      "as_a": "household member",
+      "i_want": "every mutating operation on an archived list (or its items, labels, or recipe references) to be rejected with a clear frozen error",
+      "so_that": "archived history is preserved as a true historical record",
+      "acceptance": "Given ShoppingList L1 has archived_at IS NOT NULL, when I attempt any of: PUT /lists/{L1.id}, POST /items (targeting L1), POST /items/create-bulk, PUT /items/{I.id}, PUT /items (bulk), DELETE /items/{I.id}, DELETE /items (bulk), PUT /lists/{L1.id}/label-settings, POST /lists/{L1.id}/recipe, POST /lists/{L1.id}/recipe/{rid} (deprecated), POST /lists/{L1.id}/recipe/{rid}/delete, then each response is 409 CONFLICT with detail.message == 'This shopping list is archived and cannot be modified. Unarchive it first.' (en-US value of shopping-list.archived.frozen); no rows mutated in shopping_lists / shopping_list_items / shopping_list_multi_purpose_label_settings / shopping_list_recipe_references; updated_at unchanged. Atomic pre-flight semantics: the service-level pre-flight on Group B routes runs BEFORE any sub-call to bulk_create_items / update_many."
+    },
+    {
+      "id": "US-6",
+      "priority": "P1",
+      "title": "Unarchive restores mutable state",
+      "as_a": "household member",
+      "i_want": "to unarchive a list back to mutable state",
+      "so_that": "I can correct mistakes or repurpose an archived list",
+      "acceptance": "Given ShoppingList L1 has archived_at IS NOT NULL, when I POST /api/households/shopping/lists/{L1.id}/unarchive, then response is 200 OK with archived_at == null and archived_by == null; the row has archived_at IS NULL and archived_by_user_id IS NULL; L1 reappears in default GET /lists; subsequent PUT /lists, POST /items, PUT /items, DELETE /items, PUT /label-settings, and recipe routes succeed; exactly one EventTypes.shopping_list_unarchived event is dispatched (because a state transition occurred)."
+    },
+    {
+      "id": "US-7",
+      "priority": "P1",
+      "title": "Event bus dispatches with correct payload (no cross-household leak)",
+      "as_a": "webhook/notifier subscriber configured for shopping-list-archive events in my household",
+      "i_want": "to receive exactly the spec'd payload fields on archive/unarchive",
+      "so_that": "I can integrate downstream systems without leaking other tenants' data",
+      "acceptance": "Subscribed via GroupEventNotifier with shopping_list_archived = true for H1; when any user in H1 archives a list, exactly one Event arrives with event_type == EventTypes.shopping_list_archived and document_data of type EventShoppingListArchiveData whose model_dump().keys() equals exactly {'document_type', 'operation', 'list_id', 'list_name', 'household_id', 'archived_by_user_id', 'item_count', 'total_estimated_amount'} (first two inherited from EventDocumentDataBase per event_types.py:88-91; rest declared on EventShoppingListArchiveData); operation == EventOperation.update; payload household_id equals H1; no Event arrives at subscribers in other households; symmetric for shopping_list_unarchived."
+    },
+    {
+      "id": "US-8",
+      "priority": "P1",
+      "title": "Multitenant isolation",
+      "as_a": "member of household H1 in group G1",
+      "i_want": "archived shopping lists to remain invisible to other households and groups",
+      "so_that": "tenant data boundaries are respected",
+      "acceptance": "Given H1 owns archived L1; H2 (same group G1) owns archived L2; H3 (group G2) owns archived L3; when I (in H1) GET /api/households/shopping/lists?archived=true, items contains only L1.id; when I POST /api/households/shopping/lists/{L2.id}/archive OR /unarchive, response is 404 NOT FOUND; when I POST /api/households/shopping/lists/{L3.id}/archive OR /unarchive, response is 404; when a user in H3 (group G2) issues GET /api/households/shopping/lists?archived=true, response does NOT include L1.id or L2.id; symmetric for all six (caller-household, target-household) pairs."
+    },
+    {
+      "id": "US-9",
+      "priority": "P2",
+      "title": "Schema backward compatibility (null-default, not field-omit)",
+      "as_a": "existing API consumer that does not read archived_at/archived_by",
+      "i_want": "the existing ShoppingListOut / ShoppingListSummary shapes to remain backward-compatible",
+      "so_that": "my pre-feature code continues to work without changes",
+      "acceptance": "Default GET response items have archived_at: null and archived_by: null which existing consumers ignore (JSON null on unknown field is RFC 8259 forward-compatible); all existing tests in test_group_shopping_lists.py (1113 lines, 7 baseline test methods) continue to pass unchanged. Input §6 'default query does not return these fields' is satisfied at the request-filtering layer (collection endpoint default-hides archived ROWS entirely) rather than field-projection — see exploration/consolidated.md CRITICAL-3."
+    },
+    {
+      "id": "US-10",
+      "priority": "P2",
+      "title": "Scheduled cleanup respects frozen state",
+      "as_a": "system operator",
+      "i_want": "delete_old_checked_shopping_list_items to skip archived lists",
+      "so_that": "archived history is preserved against automatic trimming",
+      "acceptance": "When the scheduled task runs against a household with both active and archived lists having >100 checked items each, active list is trimmed (existing behavior); archived list left fully intact; no ShoppingListIsArchivedError raised from scheduler context."
+    }
+  ],
+  "functional_requirements": [
+    {
+      "id": "FR-1",
+      "title": "Data model — ShoppingList extension",
+      "must_haves": [
+        "Add archived_at: FilterableColumn[datetime | None] = mapped_column(NaiveDateTime, index=True) — default NULL = active",
+        "Add archived_by_user_id: FilterableColumn[GUID | None] = mapped_column(GUID, ForeignKey('users.id', ondelete='SET NULL'), index=True) — default NULL; ondelete='SET NULL' MUST be explicit at the model layer to match the migration in FR-2",
+        "Add archived_by: Mapped[Optional['User']] = orm.relationship('User', foreign_keys=[archived_by_user_id]) — disambiguating against the existing user relationship at line 156",
+        "Update existing user relationship at line 156 to specify foreign_keys=[user_id] for SQLAlchemy disambiguation",
+        "Invariant (ONE-WAY): archived_at IS NULL ⇒ archived_by_user_id IS NULL. Enforced at service layer on archive/unarchive transitions. The REVERSE direction does NOT hold: an archived row MAY have archived_by_user_id IS NULL after the archiving user is deleted (FK is ON DELETE SET NULL). This loosened invariant resolves the contradiction with EC-8/NC-5 (review_v1_consistency C-001, review_v1_completeness COMP-H-002)."
+      ],
+      "code_references": [
+        {"file": "mealie/db/models/household/shopping_list.py", "line_ranges": "147-181", "description": "current ShoppingList class — columns added between line 158 (name) and line 159 (list_items)"},
+        {"file": "mealie/db/models/recipe/recipe.py", "line_ranges": "145,147", "description": "date_updated / last_made — NaiveDateTime FilterableColumn pattern"},
+        {"file": "mealie/db/models/household/mealplan.py", "line_ranges": "67", "description": "user_id FilterableColumn[GUID | None] FK pattern (extended with ondelete='SET NULL')"}
+      ]
+    },
+    {
+      "id": "FR-2",
+      "title": "Alembic migration (a) — shopping_lists columns",
+      "must_haves": [
+        "Use op.batch_alter_table('shopping_lists') for SQLite + PostgreSQL portability",
+        "Add archived_at: sa.Column('archived_at', mealie.db.migration_types.NaiveDateTime(), nullable=True)",
+        "Add archived_by_user_id: sa.Column('archived_by_user_id', mealie.db.migration_types.GUID(), nullable=True)",
+        "Create FK with explicit ondelete: batch_op.create_foreign_key('fk_shopping_lists_archived_by_user_id', 'users', ['archived_by_user_id'], ['id'], ondelete='SET NULL')",
+        "Create indexes: ix_shopping_lists_archived_at and ix_shopping_lists_archived_by_user_id",
+        "down_revision chains off the current head (today: 2187537c52b8 from 2026-05-18-16.27.05_2187537c52b8_add_table_for_ai_providers.py; if a newer migration has landed at generation time, chain off the actual head)",
+        "downgrade() drops both columns + FK + indexes for reversibility",
+        "Existing rows have archived_at = NULL and archived_by_user_id = NULL (no server_default needed; NULL is the default for nullable columns)"
+      ],
+      "code_references": [
+        {"file": "mealie/alembic/versions/2025-09-10-19.21.48_1d9a002d7234_add_referenced_recipe_to_ingredients.py", "line_ranges": "21-30", "description": "exact batch_alter_table -> add_column -> create_index -> create_foreign_key template for nullable GUID FK column"},
+        {"file": "mealie/alembic/versions/2024-11-20-17.30.41_b9e516e2d3b3_add_household_to_recipe_last_made_.py", "line_ranges": "183", "description": "sa.Column('last_made', mealie.db.migration_types.NaiveDateTime(), nullable=True) — exact NaiveDateTime pattern (filename truncated by alembic generator; verified by directory listing — v1's full-form filename was incorrect)"}
+      ]
+    },
+    {
+      "id": "FR-3",
+      "title": "Alembic migration (b) — group_events_notifier_options columns",
+      "must_haves": [
+        "Add shopping_list_archived: Boolean, nullable=False, server_default=sa.sql.expression.false()",
+        "Add shopping_list_unarchived: Boolean, nullable=False, server_default=sa.sql.expression.false()",
+        "down_revision chains off the migration in FR-2",
+        "downgrade() drops both columns"
+      ],
+      "code_references": [
+        {"file": "mealie/alembic/versions/2026-03-26-20.48.28_cdc93edaf73d_add_mealplan_updated_and_deleted_to_.py", "line_ranges": "1-51", "description": "exact verbatim template, only column names differ (filename truncated by alembic generator; verified by directory listing — v1's full-form filename was incorrect)"},
+        {"file": "mealie/db/models/household/events.py", "line_ranges": "35-37", "description": "existing shopping_list_{created,updated,deleted} columns — insertion point at line 38"}
+      ]
+    },
+    {
+      "id": "FR-4",
+      "title": "New API endpoints — archive / unarchive",
+      "must_haves": [
+        "POST /api/households/shopping/lists/{item_id}/archive -> archive_one(self, item_id: UUID4) -> ShoppingListOut",
+        "POST /api/households/shopping/lists/{item_id}/unarchive -> unarchive_one(self, item_id: UUID4) -> ShoppingListOut",
+        "Decorators include response_model=ShoppingListOut, status_code=200, responses={409: {'model': ErrorResponse}, 404: {'model': ErrorResponse}}",
+        "Auth inherited from BaseCrudController (no extra Depends) — any household member",
+        "Each delegates to result = self.service.archive_list(item_id, self.user.id) / result = self.service.unarchive_list(item_id) where result is ArchiveTransitionResult(shopping_list, transitioned)",
+        "Dispatch EventTypes.shopping_list_archived / EventTypes.shopping_list_unarchived via self.publish_event(..., group_id=result.shopping_list.group_id, household_id=result.shopping_list.household_id, ...) ONLY when result.transitioned is True (so EC-3 unarchive-no-op does not dispatch a spurious event — resolves review_v1_consistency C-003)",
+        "Cross-household / cross-group access returns 404 via existing HouseholdRepositoryGeneric._filter_builder + tenant-scoped WHERE in FR-7 §2/§3 (no extra code; resolves review_v1_architecture H2)",
+        "Return result.shopping_list as the response body"
+      ],
+      "code_references": [
+        {"file": "mealie/routes/households/controller_shopping_lists.py", "line_ranges": "159-229", "description": "ShoppingListController CRUD section (insert new endpoints after delete_one at line 229)"},
+        {"file": "mealie/routes/households/controller_shopping_lists.py", "line_ranges": "186-198", "description": "create_one pattern (decorator, status_code, publish_event template)"},
+        {"file": "mealie/routes/_base/base_controllers.py", "line_ranges": "199-214", "description": "BaseCrudController.publish_event signature"}
+      ]
+    },
+    {
+      "id": "FR-5",
+      "title": "Modified API endpoint — GET /lists?archived=",
+      "must_haves": [
+        "ShoppingListController.get_all accepts archived: ArchivedFilter = Query(ArchivedFilter.exclude) parameter from mealie.schema.household.group_shopping_list.ArchivedFilter (new enum — see FR-9)",
+        "Pass parameter to self.repo.page_all(pagination=q, override=ShoppingListSummary, archived=archived)",
+        "Default (no param or archived=false) returns only archived_at IS NULL rows",
+        "archived=true returns only archived_at IS NOT NULL rows",
+        "archived=all returns both"
+      ],
+      "code_references": [
+        {"file": "mealie/routes/households/controller_shopping_lists.py", "line_ranges": "176-184", "description": "current get_all implementation to modify"}
+      ]
+    },
+    {
+      "id": "FR-6",
+      "title": "Frozen routes — 409 on every list-mutating route (Group A repo-guard + Group B service pre-flight)",
+      "rationale_v2": "Resolves review_v1_architecture C1, review_v1_completeness COMP-H-003, and review_v1_consistency C-005. v1's partial-mutation acceptance of label-settings and recipe routes is rescinded: v2 freezes ALL list-mutating routes. Defense in depth uses BOTH a repository-layer guard (for routes whose write goes through RepositoryShoppingList.update or RepositoryShoppingListItem.{create,update,delete}_many) AND a service-layer pre-flight (for routes that bypass the repo guard).",
+      "group_a_repo_guard": [
+        "PUT /api/households/shopping/lists/{item_id} (controller_shopping_lists.py:204-215) — guard in RepositoryShoppingList.update",
+        "POST /api/households/shopping/items (lines 127-129) — guard in RepositoryShoppingListItem.create_many",
+        "POST /api/households/shopping/items/create-bulk (lines 121-125) — same guard",
+        "PUT /api/households/shopping/items/{item_id} (lines 141-143) — guard in RepositoryShoppingListItem.update_many",
+        "PUT /api/households/shopping/items (lines 135-139) — same guard",
+        "DELETE /api/households/shopping/items/{item_id} (lines 151-153) — guard in RepositoryShoppingListItem.delete_many",
+        "DELETE /api/households/shopping/items (lines 145-149) — same guard"
+      ],
+      "group_b_service_preflight": [
+        "PUT /api/households/shopping/lists/{item_id}/label-settings (controller_shopping_lists.py:234-254) — handler MUST call self.service.ensure_list_not_archived(item_id) at the top of the method body (line 236) BEFORE any other code; the helper raises ShoppingListIsArchivedError if archived",
+        "POST /api/households/shopping/lists/{item_id}/recipe (controller_shopping_lists.py:256-261) — same pre-flight at line 258",
+        "POST /api/households/shopping/lists/{item_id}/recipe/{recipe_id} (controller_shopping_lists.py:263-272, deprecated) — same pre-flight; OR inherits via delegation to add_recipe_ingredients_to_list",
+        "POST /api/households/shopping/lists/{item_id}/recipe/{recipe_id}/delete (controller_shopping_lists.py:274-283) — same pre-flight at line 278"
+      ],
+      "must_haves": [
+        "409 body uses ErrorResponse.respond(message=translator.t('shopping-list.archived.frozen'))",
+        "409 fires BEFORE any DB write (verify row updated_at unchanged after 409); atomic pre-flight semantics — Group B pre-flight runs BEFORE any sub-call to bulk_create_items / update_many / shopping_list_multi_purpose_labels.update_many",
+        "Pre-flight for Group B is invoked from the controller layer (not the service) so the service stays HTTP-free, but the actual guard logic lives in ShoppingListService.ensure_list_not_archived(item_id)",
+        "Helper uses self.shopping_lists.get_one(item_id) (already tenant-scoped via _filter_builder) and raises ShoppingListIsArchivedError({item_id}) if archived_at IS NOT NULL",
+        "Cross-household lookups return None (404 path); helper raises NoEntryFound for that case (mapped to 404 by mealie_registered_exceptions)"
+      ],
+      "code_references": [
+        {"file": "mealie/routes/households/controller_shopping_lists.py", "line_ranges": "98-153", "description": "ShoppingListItemController with all item endpoints"},
+        {"file": "mealie/routes/households/controller_shopping_lists.py", "line_ranges": "204-215", "description": "update_one for PUT /lists/{id} (Group A)"},
+        {"file": "mealie/routes/households/controller_shopping_lists.py", "line_ranges": "234-254", "description": "update_label_settings (Group B #8); pre-flight inserts at line 236"},
+        {"file": "mealie/routes/households/controller_shopping_lists.py", "line_ranges": "256-261", "description": "add_recipe_ingredients_to_list (Group B #9); pre-flight inserts at line 258"},
+        {"file": "mealie/routes/households/controller_shopping_lists.py", "line_ranges": "263-272", "description": "add_single_recipe_ingredients_to_list (Group B #10, deprecated; inherits via delegation)"},
+        {"file": "mealie/routes/households/controller_shopping_lists.py", "line_ranges": "274-283", "description": "remove_recipe_ingredients_from_list (Group B #11); pre-flight inserts at line 278"},
+        {"file": "mealie/schema/response/responses.py", "line_ranges": "8-19", "description": "ErrorResponse.respond(message=...) envelope format"}
+      ]
+    },
+    {
+      "id": "FR-7",
+      "title": "Repository layer — centralised archive filter + guard (RepositoryShoppingList)",
+      "must_haves": [
+        "update(item_id, data) override (extends existing override at lines 9-11): tenant-scoped fetch via self.session.execute(self._query(with_options=False).filter_by(**self._filter_builder(id=item_id))).scalars().one_or_none(); if None, delegate to super().update(item_id, data) (preserves existing 404 behavior); if row.archived_at is not None, raise ShoppingListIsArchivedError({item_id}); else delegate to super().update(item_id, data)",
+        "archive(item_id, user_id) -> ArchiveTransitionResult (NEW): tenant-scoped fetch first; if None, raise NoEntryFound() (mapped to 404 by global handler); if row.archived_at is not None, raise ShoppingListIsArchivedError({item_id}); else issue a tenant-scoped UPDATE: sa.update(ShoppingList).where(ShoppingList.id == item_id, ShoppingList.group_id == self.group_id, ShoppingList.user_id.in_(sa.select(User.id).where(User.household_id == self.household_id))).values(archived_at=datetime.now(UTC), archived_by_user_id=user_id); execute; return ArchiveTransitionResult(shopping_list=self.get_one(item_id), transitioned=True). The WHERE clause mirrors _filter_builder's tenant scoping, preventing cross-household writes (resolves review_v1_architecture H2)",
+        "unarchive(item_id) -> ArchiveTransitionResult (NEW): tenant-scoped fetch first; if None, raise NoEntryFound(); if row.archived_at is None, return ArchiveTransitionResult(shopping_list=<refreshed via get_one>, transitioned=False) — idempotent no-op, NOT a 409; controller will skip event dispatch (resolves review_v1_consistency C-003); else issue tenant-scoped UPDATE clearing both columns; return ArchiveTransitionResult(..., transitioned=True)",
+        "page_all(pagination, override=None, search=None, archived: ArchivedFilter = ArchivedFilter.exclude) override: builds base query via self._query(...), applies self._filter_builder() via filter_by(**fltr), appends .where(ShoppingList.archived_at.is_(None)) for exclude / .is_not(None) for only / no clause for inclusive; continues with add_pagination_to_query / loader_options / materialize as in RepositoryGeneric.page_all (315-355)",
+        "get_archived_ids(ids: set[UUID4]) -> set[UUID4] (NEW): returns subset of ids currently archived AND visible to caller; single SQL: SELECT id FROM shopping_lists WHERE id IN :ids AND archived_at IS NOT NULL AND group_id = :group_id AND user_id IN (SELECT id FROM users WHERE household_id = :household_id)",
+        "Typed exceptions declared in mealie/core/exceptions.py alongside existing NoEntryFound/PermissionDenied: ShoppingListIsArchivedError(list_ids: set[UUID4]) and ShoppingListArchivePreconditionError(list_ids: set[UUID4])",
+        "ArchiveTransitionResult(NamedTuple) with fields shopping_list: ShoppingListOut and transitioned: bool — declared in mealie/services/household_services/shopping_lists.py (NOT exceptions.py)",
+        "Default-exclude filter MUST compose correctly with HouseholdRepositoryGeneric._filter_builder so household/group isolation is preserved for all archived values"
+      ],
+      "code_references": [
+        {"file": "mealie/repos/repository_shopping_list.py", "line_ranges": "1-12", "description": "current full file — the seam"},
+        {"file": "mealie/repos/repository_generic.py", "line_ranges": "79-92", "description": "_query with AssociationProxyInstance handling"},
+        {"file": "mealie/repos/repository_generic.py", "line_ranges": "94-102", "description": "_filter_builder injecting group_id + household_id"},
+        {"file": "mealie/repos/repository_generic.py", "line_ranges": "156-179", "description": "get_one pattern (tenant-scoped) to mirror for §1/§2/§3 pre-fetch"},
+        {"file": "mealie/repos/repository_generic.py", "line_ranges": "315-355", "description": "page_all pattern to mirror in §4 override"},
+        {"file": "mealie/repos/repository_generic.py", "line_ranges": "505-523", "description": "HouseholdRepositoryGeneric constructor signature"},
+        {"file": "mealie/core/exceptions.py", "line_ranges": "1-90", "description": "existing typed-exception module to extend with ShoppingListIsArchivedError + ShoppingListArchivePreconditionError"}
+      ]
+    },
+    {
+      "id": "FR-8",
+      "title": "New repository — RepositoryShoppingListItem (constructor-injection only)",
+      "must_haves": [
+        "NEW file mealie/repos/repository_shopping_list_item.py with class RepositoryShoppingListItem(HouseholdRepositoryGeneric[ShoppingListItemOut, ShoppingListItem])",
+        "Constructor MUST accept parent_repo: RepositoryShoppingList — this is the SINGLE normative wiring; v1's 'or equivalent reference' is rescinded (resolves review_v1_architecture M2, review_v1_consistency C-007, review_v1_executability ambiguity finding). Pattern: def __init__(self, *args, parent_repo: RepositoryShoppingList, **kwargs): super().__init__(*args, **kwargs); self._parent_repo = parent_repo",
+        "create_many(items): distinct_list_ids = {i.shopping_list_id for i in items}; archived = self._parent_repo.get_archived_ids(distinct_list_ids); if archived non-empty, raise ShoppingListIsArchivedError(archived); else super().create_many(items)",
+        "update_many(items): same pattern, extracting distinct_list_ids from items",
+        "delete_many(ids): first SELECT DISTINCT shopping_list_id FROM shopping_list_items WHERE id IN :ids (scoped to current tenant via JOIN on shopping_lists if needed); call self._parent_repo.get_archived_ids; raise or super().delete_many(ids)",
+        "repository_factory.py:323-332 swaps raw HouseholdRepositoryGeneric for RepositoryShoppingListItem, passing parent_repo=self.group_shopping_lists"
+      ],
+      "code_references": [
+        {"file": "mealie/repos/repository_factory.py", "line_ranges": "317-321", "description": "group_shopping_lists cached_property (factory pattern)"},
+        {"file": "mealie/repos/repository_factory.py", "line_ranges": "323-332", "description": "group_shopping_list_item cached_property to swap"},
+        {"file": "mealie/repos/repository_generic.py", "line_ranges": "505-523", "description": "HouseholdRepositoryGeneric ctor signature"}
+      ]
+    },
+    {
+      "id": "FR-9",
+      "title": "Schema additions",
+      "must_haves": [
+        "New enum ArchivedFilter(StrEnum) at top of mealie/schema/household/group_shopping_list.py (after imports, before ShoppingListItemRecipeRefCreate at line 32): exclude='false', only='true', inclusive='all'",
+        "ShoppingListSummary (lines 216-238) gains archived_at: datetime | None = None and archived_by: UserSummary | None = None",
+        "ShoppingListSummary.loader_options() (lines 224-238) extended with selectinload(ShoppingList.archived_by).load_only(User.id, User.group_id, User.household_id, User.username, User.full_name)",
+        "ShoppingListOut (lines 250-285) gains same two fields and same loader_options extension at lines 261-285",
+        "Imports added: from enum import StrEnum; from mealie.schema.user.user import UserSummary",
+        "Default None values preserve backward compatibility (US-9). Per consolidated.md CRITICAL-3, the field is ALWAYS present on the schema; the 'default omit' requirement in input §6 is satisfied at the request-filtering level (collection endpoint default-hides archived ROWS), NOT at the field-projection level. Binding interpretation, not a deviation. Resolves review_v1_completeness COMP-C-001 with explicit REJECTION rationale (see rewrite_v1_to_v2.md)"
+      ],
+      "code_references": [
+        {"file": "mealie/schema/household/group_shopping_list.py", "line_ranges": "216-238", "description": "ShoppingListSummary class to extend"},
+        {"file": "mealie/schema/household/group_shopping_list.py", "line_ranges": "250-285", "description": "ShoppingListOut class to extend"},
+        {"file": "mealie/schema/user/user.py", "line_ranges": "191-197", "description": "UserSummary class"}
+      ]
+    },
+    {
+      "id": "FR-10",
+      "title": "Event bus additions (input-literal field names; explicit operation field)",
+      "must_haves": [
+        "Two new EventTypes enum members at line 44 (after shopping_list_deleted): shopping_list_archived = auto(); shopping_list_unarchived = auto()",
+        "New payload class EventShoppingListArchiveData(EventDocumentDataBase) after EventShoppingListData (lines 130-132): document_type: EventDocumentType = EventDocumentType.shopping_list; list_id: UUID4; list_name: str | None = None; household_id: UUID4; archived_by_user_id: UUID4 | None = None; item_count: int = 0; total_estimated_amount: float | None = None. The 'operation' field is INHERITED from EventDocumentDataBase (event_types.py:88-91); callers supply it via the constructor as operation=EventOperation.update for both archive and unarchive dispatches",
+        "GroupEventNotifierOptionsModel (events.py:15-57) gains shopping_list_archived and shopping_list_unarchived boolean columns at lines 38-39 (matches FR-3)",
+        "FIELD NAME DECISION (input §5 literal compliance — resolves review_v1_completeness COMP-C-002 and REVERSES v1 NC-3 default): use input's exact field names list_id and list_name (NOT shopping_list_id/shopping_list_name). New payload class lives in a new dedicated namespace; document_type disambiguates entity type at bus level. The asymmetry with existing EventShoppingListData.shopping_list_id is acceptable: input contract explicitly enumerates list_id/list_name; new class is for new event types only; subscribers receive full envelope including event_type and document_type for routing",
+        "FULL PAYLOAD KEY SET (model_dump().keys()) is exactly 8 keys: {'document_type', 'operation', 'list_id', 'list_name', 'household_id', 'archived_by_user_id', 'item_count', 'total_estimated_amount'}. First two inherited from EventDocumentDataBase; rest declared on EventShoppingListArchiveData. NO additional fields — MUST NOT embed User objects, full ShoppingListOut, or any field referencing entities in other households/groups (resolves review_v1_consistency C-002)",
+        "OPERATION VALUE: both archive and unarchive dispatches use operation=EventOperation.update (consistent with existing shopping_list_updated dispatch at controller_shopping_lists.py:209/223; archive/unarchive is conceptually a metadata update on the list)",
+        "item_count semantics: equals len(shopping_list.list_items) at moment of state transition",
+        "total_estimated_amount semantics: no price column exists on ShoppingListItem (verified). Set to None unconditionally — forward-compat hook for a future price-tracking feature. Coding phase MUST NOT compute the field from any existing column (no quantity * price synthesis)",
+        "Dispatcher contract: controller passes group_id=result.shopping_list.group_id, household_id=result.shopping_list.household_id (NOT self.group_id/self.household_id) so EventBusService.dispatch (event_bus_service.py:66-96) targets the owning household exactly. Per-household subscriber filtering happens in _get_listeners / _publish_event (event_bus_service.py:54-64) — listeners are constructed scoped to (group_id, household_id) so cross-household leakage is impossible at the dispatch layer"
+      ],
+      "code_references": [
+        {"file": "mealie/services/event_bus_service/event_types.py", "line_ranges": "13-60", "description": "EventTypes enum"},
+        {"file": "mealie/services/event_bus_service/event_types.py", "line_ranges": "14-22", "description": "docstring mandating DB migration on enum changes"},
+        {"file": "mealie/services/event_bus_service/event_types.py", "line_ranges": "88-91", "description": "EventDocumentDataBase declaring document_type AND operation (the inherited base fields)"},
+        {"file": "mealie/services/event_bus_service/event_types.py", "line_ranges": "130-132", "description": "existing EventShoppingListData (insertion point for new class)"},
+        {"file": "mealie/db/models/household/events.py", "line_ranges": "35-37", "description": "shopping_list_{created,updated,deleted} columns (insertion point at line 38)"},
+        {"file": "mealie/services/event_bus_service/event_bus_service.py", "line_ranges": "54-64", "description": "_get_listeners + _publish_event constructing tenant-scoped subscribers"},
+        {"file": "mealie/services/event_bus_service/event_bus_service.py", "line_ranges": "66-96", "description": "dispatch method with per-household loop at 82-96"}
+      ]
+    },
+    {
+      "id": "FR-11",
+      "title": "Service layer — archive_list / unarchive_list + frozen pre-flight (HTTP-free) + global exception handler",
+      "must_haves": [
+        "ArchiveTransitionResult(NamedTuple) declared near top of mealie/services/household_services/shopping_lists.py (after imports): shopping_list: ShoppingListOut; transitioned: bool",
+        "ShoppingListService.archive_list(self, list_id: UUID4, user_id: UUID4) -> ArchiveTransitionResult (NEW; insert after create_one_list at line 554): fetch shopping_list = self.shopping_lists.get_one(list_id); if None raise NoEntryFound() (caught by mealie_registered_exceptions -> 404); if shopping_list.archived_at is not None raise ShoppingListIsArchivedError({list_id}) (caught by global handler -> 409 shopping-list.archived.frozen); validate all-items-checked precondition treating None as unchecked: any((item.checked is None or item.checked is False) for item in shopping_list.list_items); if True raise ShoppingListArchivePreconditionError({list_id}) (NEW typed exception -> 409 shopping-list.archive.unchecked-items); else call result = self.shopping_lists.archive(list_id, user_id); return result",
+        "ShoppingListService.unarchive_list(self, list_id: UUID4) -> ArchiveTransitionResult (NEW; insert after archive_list): fetch via get_one (raise NoEntryFound if None); call result = self.shopping_lists.unarchive(list_id); return result (controller inspects result.transitioned to decide event dispatch)",
+        "ShoppingListService.ensure_list_not_archived(self, list_id: UUID4) -> None (NEW; used by FR-6 Group B pre-flight): fetch via get_one; raise NoEntryFound if None; raise ShoppingListIsArchivedError({list_id}) if archived_at IS NOT NULL; else return None",
+        "GLOBAL FastAPI EXCEPTION HANDLER (NEW; in mealie/routes/handlers.py) — resolves review_v1_architecture M1 and review_v1_consistency C-004 (HTTP/i18n out of service). register_archive_handlers(app: FastAPI) adds @app.exception_handler(ShoppingListIsArchivedError) returning JSONResponse(status_code=409, content=ErrorResponse.respond(message=translator.t('shopping-list.archived.frozen'))) and @app.exception_handler(ShoppingListArchivePreconditionError) returning the same with key shopping-list.archive.unchecked-items. register_archive_handlers(app) called in mealie/app.py wherever register_debug_handler is currently invoked (verified at handlers.py:18)",
+        "SERVICE STAYS HTTP-FREE: none of archive_list, unarchive_list, ensure_list_not_archived, or existing bulk_create_items / bulk_update_items / bulk_delete_items raise HTTPException. Bulk methods just propagate ShoppingListIsArchivedError from repo (no try/except needed; global handler catches at FastAPI boundary). Eliminates translator-dependency-injection problem (v1 SCN-1) and layering violation (review_v1_consistency C-004)"
+      ],
+      "code_references": [
+        {"file": "mealie/services/household_services/shopping_lists.py", "line_ranges": "37-43", "description": "ShoppingListService.__init__ (UNCHANGED — no translator added)"},
+        {"file": "mealie/services/household_services/shopping_lists.py", "line_ranges": "154-223", "description": "bulk_create_items (UNCHANGED — propagates ShoppingListIsArchivedError raised by RepositoryShoppingListItem.create_many)"},
+        {"file": "mealie/services/household_services/shopping_lists.py", "line_ranges": "225-310", "description": "bulk_update_items (UNCHANGED — same propagation)"},
+        {"file": "mealie/services/household_services/shopping_lists.py", "line_ranges": "312-321", "description": "bulk_delete_items (UNCHANGED — same propagation)"},
+        {"file": "mealie/services/household_services/shopping_lists.py", "line_ranges": "541-554", "description": "create_one_list (insertion point for new methods at line 555+)"},
+        {"file": "mealie/routes/handlers.py", "line_ranges": "1-32", "description": "existing register_debug_handler; register_archive_handlers lives in the same file"},
+        {"file": "mealie/core/exceptions.py", "line_ranges": "73-83", "description": "mealie_registered_exceptions mapping (existing NoEntryFound -> 404 wiring; no change needed for NoEntryFound raises in new service methods)"}
+      ]
+    },
+    {
+      "id": "FR-12",
+      "title": "Multitenant isolation",
+      "must_haves": [
+        "Cross-household and cross-group operations MUST continue to return 404 (NOT 403) via existing HouseholdRepositoryGeneric._filter_builder PLUS tenant-scoped WHERE clauses in new archive/unarchive repo methods (FR-7 §2/§3 — resolves review_v1_architecture H2)",
+        "GET /api/households/shopping/lists?archived=true from H2 MUST NOT include H1's archived lists",
+        "POST /api/households/shopping/lists/{H1_list.id}/archive from H2 MUST return 404 (because self.shopping_lists.get_one(list_id) in archive_list returns None when the list's user.household_id != self.household_id, AND the repo's archive method's UPDATE WHERE clause would not match anyway)",
+        "Same for /unarchive, PUT /lists/{id}, item mutations targeting another household's list",
+        "Event payloads contain ONLY owning household's data (enforced by EventShoppingListArchiveData class construction)",
+        "AGR-8 from consolidated.md is locked: new RepositoryShoppingList.page_all override composes the archived predicate via .where(...) AFTER _filter_builder injects group_id+household_id, preserving isolation for all archived values"
+      ],
+      "code_references": [
+        {"file": "mealie/repos/repository_generic.py", "line_ranges": "94-102", "description": "_filter_builder"},
+        {"file": "mealie/repos/repository_generic.py", "line_ranges": "156-179", "description": "get_one tenant-scoped pattern"},
+        {"file": "mealie/repos/repository_generic.py", "line_ranges": "505-523", "description": "HouseholdRepositoryGeneric ctor"},
+        {"file": "mealie/routes/_base/base_controllers.py", "line_ranges": "199-214", "description": "publish_event accepts explicit group_id/household_id"},
+        {"file": "mealie/services/event_bus_service/event_bus_service.py", "line_ranges": "54-64", "description": "tenant-scoped listener construction"},
+        {"file": "mealie/services/event_bus_service/event_bus_service.py", "line_ranges": "66-96", "description": "dispatch filters subscribers per household"}
+      ]
+    },
+    {
+      "id": "FR-13",
+      "title": "i18n (en-US only; explicit divergence from input §7 multi-locale requirement)",
+      "must_haves": [
+        "mealie/lang/messages/en-US.json MUST gain new top-level shopping-list namespace with nested keys: archive.unchecked-items = 'Cannot archive a shopping list while items remain unchecked' and archived.frozen = 'This shopping list is archived and cannot be modified. Unarchive it first.'",
+        "Backend Translator.t('shopping-list.archive.unchecked-items') resolves to en-US string",
+        "Backend Translator.t('shopping-list.archived.frozen') resolves to en-US string",
+        "EXPLICIT DIVERGENCE FROM INPUT §7 'lang/messages/ all existing language files' — review_v1_completeness COMP-C-003 REJECTED with binding rationale: all other locale files (af-ZA.json through zh-TW.json, 41 files per directory listing) MUST NOT be modified. Hard repository policy stated in Downloads/mealie/.github/copilot-instructions.md ('Only modify en-US locale files when adding new translation strings — other locales are managed via Crowdin and must never be modified (PRs modifying non-English locales will be rejected)'). Adding fallback values in non-English locales would cause PR to be rejected by CI. Input requirement reinterpreted as 'at minimum en-US, with Crowdin filling in the rest on its normal cadence'. Crowdin auto-detects new English keys and surfaces them for translation; no manual cross-locale fan-out is required or permitted in the same PR"
+      ],
+      "code_references": [
+        {"file": "mealie/lang/messages/en-US.json", "line_ranges": "1-95", "description": "current file (4109 bytes, 9 top-level keys, no shopping-list namespace)"},
+        {"file": "mealie/lang/messages/en-US.json", "line_ranges": "46-53", "description": "existing exceptions namespace (parallel pattern)"},
+        {"file": ".github/copilot-instructions.md", "line_ranges": "n/a (root)", "description": "policy citation: 'Only en-US locale files when adding new translation strings — other locales are managed via Crowdin and must never be modified'"}
+      ]
+    },
+    {
+      "id": "FR-14",
+      "title": "Scheduled cleanup compatibility",
+      "must_haves": [
+        "Modify mealie/services/scheduler/tasks/delete_old_checked_shopping_list_items.py line 69 to pass archived=ArchivedFilter.exclude to page_all so scheduler skips archived lists",
+        "Import ArchivedFilter from mealie.schema.household.group_shopping_list",
+        "Prevents new repo-level guard from raising ShoppingListIsArchivedError from cron context (no HTTP translation layer)"
+      ],
+      "code_references": [
+        {"file": "mealie/services/scheduler/tasks/delete_old_checked_shopping_list_items.py", "line_ranges": "54-75", "description": "delete_old_checked_list_items task"},
+        {"file": "mealie/services/scheduler/tasks/delete_old_checked_shopping_list_items.py", "line_ranges": "69", "description": "exact line to modify (page_all call)"}
+      ]
+    },
+    {
+      "id": "FR-15",
+      "title": "Codegen artifacts (auto-regenerated; not hand-edited)",
+      "must_haves": [
+        "After backend changes land, task dev:generate regenerates: frontend/app/lib/api/types/household.ts with new archivedAt and archivedBy fields on ShoppingListSummary (currently lines 735-748) and ShoppingListOut (currently lines 673-687)",
+        "frontend/app/lib/api/types/events.ts with new enum members and EventShoppingListArchiveData interface",
+        "mealie/schema/household/__init__.py with re-export of ArchivedFilter",
+        "tests/utils/api_routes/__init__.py with helpers households_shopping_lists_item_id_archive(id) and households_shopping_lists_item_id_unarchive(id)",
+        "PR MUST NOT hand-edit any of these files (CI detects drift and rejects)"
+      ],
+      "code_references": [
+        {"file": "frontend/app/lib/api/types/household.ts", "line_ranges": "673-687", "description": "current ShoppingListOut shape"},
+        {"file": "frontend/app/lib/api/types/household.ts", "line_ranges": "735-748", "description": "current ShoppingListSummary shape"},
+        {"file": "tests/utils/api_routes/__init__.py", "line_ranges": "114", "description": "current households_shopping_lists constant"}
+      ]
+    }
+  ],
+  "success_criteria": [
+    {
+      "id": "SC-1",
+      "title": "Archive idempotency",
+      "measurement": "Calling POST /archive on already-archived list returns 409 (not 200, not 500). Integration test asserts response.status_code == 409 AND response.json()['detail']['message'] == 'This shopping list is archived and cannot be modified. Unarchive it first.'"
+    },
+    {
+      "id": "SC-2",
+      "title": "All 11 frozen route variants return 409 with i18n message",
+      "measurement": "Integration tests cover each of the 11 frozen route variants in FR-6 (Group A 7: PUT list, POST item, POST items/create-bulk, PUT item, PUT items, DELETE item, DELETE items; Group B 4: PUT label-settings, POST /recipe, POST /recipe/{rid} deprecated, POST /recipe/{rid}/delete). Each test asserts response.status_code == 409 AND response.json()['detail']['message'] == 'This shopping list is archived and cannot be modified. Unarchive it first.' AND that no rows in shopping_lists/shopping_list_items/shopping_list_multi_purpose_label_settings/shopping_list_recipe_references were modified (compare updated_at and row counts before/after). Count: 11 distinct test methods. Resolves review_v1_consistency C-006: title matches measurement."
+    },
+    {
+      "id": "SC-3",
+      "title": "Event payload field-set is exactly the spec'd 8-key set (with operation)",
+      "measurement": "Test using monkeypatch.setattr on EventBusService.dispatch captures dispatched events; asserts set(payload.model_dump().keys()) == {'document_type', 'operation', 'list_id', 'list_name', 'household_id', 'archived_by_user_id', 'item_count', 'total_estimated_amount'} for shopping_list_archived AND shopping_list_unarchived events. Also asserts payload.operation == EventOperation.update. No additional keys (no User object, no list_items collection)"
+    },
+    {
+      "id": "SC-4",
+      "title": "Event payload household isolation",
+      "measurement": "Test where user U1 in household H1 archives list L1; captured EventBusService.dispatch shows household_id in dispatch args equals H1.id (NOT H2.id, NOT None). Asserted via captured[0]['household_id'] == H1.id"
+    },
+    {
+      "id": "SC-5",
+      "title": "Default GET filter correctness",
+      "measurement": "Three integration tests: (a) given one active + one archived list in H1, GET /lists returns 1 item with the active list's id; total==1. (b) GET /lists?archived=true returns 1 item with the archived list's id; total==1. (c) GET /lists?archived=all returns 2 items containing both ids"
+    },
+    {
+      "id": "SC-6",
+      "title": "Multitenant isolation — same-group different-household (GET + mutations, multiple assertions)",
+      "measurement": "Using h2_user fixture: H2 user calls GET /lists?archived=true, response items DO NOT contain any list owned by H1. H2 user calls POST /lists/{H1_list.id}/archive → 404. H2 user calls POST /lists/{H1_list.id}/unarchive → 404. H2 user calls PUT /lists/{H1_list.id} → 404. H2 user calls POST /items with shopping_list_id == H1_list.id → 404. 5 sub-assertions in 1 test method (resolves review_v1_completeness COMP-H-001 by splitting into explicit scenarios)"
+    },
+    {
+      "id": "SC-7",
+      "title": "Multitenant isolation — cross-group (GET via parametrized framework)",
+      "measurement": "ArchivedShoppingListsTestCase registered in tests/multitenant_tests/test_multitenant_cases.py all_cases; parametrized test_multitenant_cases_get_all automatically asserts user_two (different group) sees empty list when user_one's group has archived lists seeded"
+    },
+    {
+      "id": "SC-8",
+      "title": "i18n key presence",
+      "measurement": "Unit test asserts Translator(locale='en-US').t('shopping-list.archive.unchecked-items') == 'Cannot archive a shopping list while items remain unchecked' AND t('shopping-list.archived.frozen') == 'This shopping list is archived and cannot be modified. Unarchive it first.' (both keys MUST be resolvable, no KeyError)"
+    },
+    {
+      "id": "SC-9",
+      "title": "Migration reversibility",
+      "measurement": "alembic upgrade head then alembic downgrade -2 (down past both new migrations); database table shopping_lists no longer has archived_at/archived_by_user_id columns; group_events_notifier_options no longer has shopping_list_archived/shopping_list_unarchived columns. Existing rows preserved. Verified by CI matrix on SQLite + PostgreSQL"
+    },
+    {
+      "id": "SC-10",
+      "title": "Test count by category",
+      "measurement": "At least: 5 unit tests (tests/unit_tests/ covering archive_list success, archive_list 409 unchecked-items, archive_list 409 already-archived, unarchive_list no-op success WITHOUT event dispatch, RepositoryShoppingList.page_all ArchivedFilter branches); ≥14 integration tests in test_group_shopping_lists.py covering US-1..US-7 + US-10 (11 are the FR-6 frozen-route tests counted under SC-2); ≥5 multitenant tests (1 new case_shopping_list_archive.py registered in all_cases + 4 explicit assertions in new test_shopping_list_archive_household.py for SC-6 / SC-13)"
+    },
+    {
+      "id": "SC-11",
+      "title": "Backward compatibility — existing tests pass",
+      "measurement": "All currently-passing tests in tests/integration_tests/user_household_tests/test_group_shopping_lists.py (1113 lines, 7+ baseline test methods listed in consolidated.md §1.2 T1) and test_group_shopping_list_items.py (623 lines) continue to pass without modification. Verified via task py:test"
+    },
+    {
+      "id": "SC-12",
+      "title": "Scheduler does not regress",
+      "measurement": "Unit test for delete_old_checked_list_items: given household with 1 archived list (150 checked items) and 1 active list (150 checked items), after task runs, archived list still has 150 items, active list has 100 (MAX_CHECKED_ITEMS); no HTTPException, no ShoppingListIsArchivedError raised; logs clean"
+    },
+    {
+      "id": "SC-13",
+      "title": "Multitenant isolation — cross-group archive/unarchive returns 404",
+      "measurement": "NEW integration test in tests/multitenant_tests/test_shopping_list_archive_household.py named test_cross_group_archive_returns_404: g2_user (different group) calls POST /lists/{g1_list.id}/archive → 404; symmetric for /unarchive. Plus test_cross_household_archive_returns_404: h2_user (same group, different household) calls archive/unarchive on H1's list → 404. Together these enumerate all 3 multitenant scenarios required by input §8: (1) same-group GET isolation (SC-6), (2) cross-group GET isolation (SC-7), (3) cross-household/cross-group archive 404 (SC-13). Resolves review_v1_completeness COMP-H-001"
+    },
+    {
+      "id": "SC-14",
+      "title": "Unarchive no-op does NOT dispatch event",
+      "measurement": "Test where U1 calls POST /unarchive on an already-active list L_active: asserts response.status_code == 200, response.json()['archivedAt'] is None; asserts EventBusService.dispatch was NOT called for EventTypes.shopping_list_unarchived during the request (verified via monkeypatch capture). Resolves review_v1_consistency C-003"
+    },
+    {
+      "id": "SC-15",
+      "title": "archived_by_user_id ON DELETE SET NULL round-trip",
+      "measurement": "Integration test: U1 archives L1 (archived_by_user_id == U1.id). Admin deletes U1's user account. Re-fetch L1 via GET /lists/{L1.id}. Assert response.status_code == 200, archived_at is not None (list still archived), archived_by is None (FK cleared). Verifies loosened invariant from FR-1 and ondelete='SET NULL' in FR-2. Resolves review_v1_completeness COMP-H-002"
+    }
+  ],
+  "edge_cases": [
+    {
+      "id": "EC-1",
+      "title": "Archive an empty list (no items)",
+      "scenario": "ShoppingList L1 exists with list_items == []",
+      "expected": "POST /archive succeeds (the 'all items checked' precondition is vacuously true). L1.archived_at is set; event dispatched with item_count == 0 and total_estimated_amount: None",
+      "why_matters": "Without explicit handling, all(item.checked for item in []) evaluates True (correct), but the event payload's total_estimated_amount and downstream consumers might assume non-empty"
+    },
+    {
+      "id": "EC-2",
+      "title": "Archive when exactly 1 item is unchecked",
+      "scenario": "L1 has 9 items with checked=True, 1 with checked=False",
+      "expected": "POST /archive returns 409 with shopping-list.archive.unchecked-items message. List NOT archived",
+      "why_matters": "Boundary case for the precondition logic; ensures 'any unchecked' check is short-circuiting correctly"
+    },
+    {
+      "id": "EC-2b",
+      "title": "Archive when 1 item has checked = None (NULL in DB)",
+      "scenario": "L1 has 9 items with checked=True, 1 with checked=None",
+      "expected": "POST /archive returns 409 — NULL is treated as unchecked (precondition: any((item.checked is None or item.checked is False) for item in shopping_list.list_items))",
+      "why_matters": "ShoppingListItem.checked: FilterableColumn[bool | None] (shopping_list.py:65) allows NULL; precondition MUST treat NULL as unchecked to be safe"
+    },
+    {
+      "id": "EC-3",
+      "title": "Unarchive a non-archived list (NO event dispatched)",
+      "scenario": "L1 has archived_at IS NULL",
+      "expected": "POST /unarchive returns 200 OK with list unchanged (idempotent no-op). NO event is dispatched (no state change — controller inspects ArchiveTransitionResult.transitioned == False and skips publish_event)",
+      "why_matters": "Distinguishes from 'archive an already-archived list' which IS a 409 — asymmetry is intentional: archive failure signals re-archive attempt (potentially programming error worth surfacing), while unarchive on active list is benign cleanup. Verified by SC-14. Resolves review_v1_consistency C-003"
+    },
+    {
+      "id": "EC-4",
+      "title": "Archive cascade — downstream consumers inventory",
+      "scenario": "Multiple downstream consumers of shopping lists may exist",
+      "expected": "Cookbook: NO interaction (cookbooks are recipe collections; mealie/db/models/household/cookbook.py + mealie/repos/repository_cookbooks.py + mealie/routes/households/controller_cookbooks.py). There is NO mealie/services/household_services/cookbook_service.py (verified by directory listing of mealie/services/household_services/); cookbooks do NOT consume shopping lists. Meal plan: does NOT consume shopping lists; meal-plan-to-shopping-list flows one direction (meal plan generates items); mealie/routes/households/controller_mealplan.py does NOT reference ShoppingList. delete_old_checked_shopping_list_items.py scheduler: currently iterates ALL shopping lists including archived ones (scheduler/tasks/delete_old_checked_shopping_list_items.py:69); without FR-14 fix, would trigger ShoppingListIsArchivedError from repo guard in cron context — fix MANDATED in FR-14. Backup/export (mealie/services/backups_v2/): dumps full ORM rows; new columns automatically flow into backup. Restore re-populates them. No code change needed; verified by existing backup version-bump tests under tests/unit_tests/services_tests/backup_v2_tests/. Frontend offline PWA queue (frontend/app/composables/use-shopping-list-item-actions.ts): will receive 409s on flush if user archived a list while items were queued offline; recommended (out of v1 scope): drop failing op rather than retry forever",
+      "why_matters": "Input §三环节考察点 explicitly asks 'have you enumerated all downstream consumers?' This is the verified inventory"
+    },
+    {
+      "id": "EC-5",
+      "title": "Backup/export of archived lists",
+      "scenario": "Operator runs POST /api/admin/backups after some lists archived",
+      "expected": "Backup contains all shopping_lists rows including archived_at + archived_by_user_id columns. Restore re-creates them with same archived state",
+      "why_matters": "Verified via task py:test -- tests/unit_tests/services_tests/backup_v2_tests/ (verified path; CORRECTED from v1's incorrect tests/integration_tests/backup_v2_tests/). No new test required for v1 (existing backup-roundtrip test inherently covers new columns)"
+    },
+    {
+      "id": "EC-6",
+      "title": "Admin override / force unarchive",
+      "scenario": "Per input §三环节考察点: 'is admin force-unarchive needed?'",
+      "expected": "NOT in v1 scope. Existing BaseAdminController (mealie/routes/_base/base_controllers.py:175-189) clears household scoping, so admin would naturally see ALL households' archived lists via /api/admin/... routes. No admin-specific archive/unarchive endpoint added in v1. The current archive_one/unarchive_one endpoints inherit BaseCrudController behavior; admin user calling regular endpoint succeeds only if belongs to owning household. Force-unarchive across households is a separate feature",
+      "why_matters": "Input §三环节考察点 explicitly flags this. Tracked under self_concerns for v2 consideration"
+    },
+    {
+      "id": "EC-7",
+      "title": "Concurrent archive race (two users same household)",
+      "scenario": "U1 and U2 both belong to H1; both POST /archive on L1 at the same time when L1 is active",
+      "expected": "One succeeds (race winner sets archived_by_user_id). The other receives 409 + shopping-list.archived.frozen because by the time RepositoryShoppingList.archive runs its pre-fetch (FR-7 §2), it sees archived_at IS NOT NULL and raises ShoppingListIsArchivedError",
+      "why_matters": "Without the 'already archived' check inside archive, both writes would commit and the second silently overwrites archived_by_user_id. FR-7 §2 requires the guard. Out of scope for v1: add unique partial index WHERE archived_at IS NULL for stronger DB-level guarantees"
+    },
+    {
+      "id": "EC-8",
+      "title": "User who archived a list is deleted (FK SET NULL)",
+      "scenario": "User U1 archives list L1 (archived_by_user_id == U1.id); later U1's account is deleted",
+      "expected": "archived_by_user_id FK is declared with ondelete='SET NULL' in BOTH the SQLAlchemy model (FR-1: ForeignKey('users.id', ondelete='SET NULL')) AND the Alembic migration (FR-2: batch_op.create_foreign_key(..., ondelete='SET NULL')). User deletion succeeds. L1 retains archived_at IS NOT NULL (still archived) and gets archived_by_user_id IS NULL",
+      "why_matters": "Codifies loosened invariant in FR-1: archived_at IS NULL ⇒ archived_by_user_id IS NULL (one-way only). Archived rows MAY have archived_by_user_id IS NULL. Verified by SC-15. Resolves review_v1_architecture H1, review_v1_consistency C-001, review_v1_completeness COMP-H-002"
+    },
+    {
+      "id": "EC-9",
+      "title": "Frozen Group B routes — atomic pre-flight semantics",
+      "scenario": "L1 is archived. User U1 calls POST /api/households/shopping/lists/{L1.id}/recipe with a payload that would add 5 new ingredients to the list",
+      "expected": "Controller's first action (FR-6 #9) is self.service.ensure_list_not_archived(L1.id), which raises ShoppingListIsArchivedError (mapped to 409 by global handler). The handler body — including self.service.add_recipe_ingredients_to_list(...) which would call bulk_create_items AND self.shopping_lists.update(...) — never executes. No new rows in shopping_list_items, shopping_list_recipe_references. No mutation to shopping_lists.recipe_references. Atomic pre-flight semantics preserved",
+      "why_matters": "Resolves v1 SCN-2 partial-failure concern and review_v1_completeness COMP-H-003. SC-2 row-count assertion after each Group B test confirms zero mutations occurred"
+    }
+  ],
+  "needs_clarification": [
+    {
+      "id": "NC-1",
+      "question": "Should label-settings and recipe-management routes also return 409 on archived lists?",
+      "conflict_original": "Spec §3 enumerated exactly 4 routes; label-settings bypasses RepositoryShoppingList.update; recipe routes have partial-mutation paths",
+      "v2_resolution": "RESOLVED — FREEZE ALL list-mutating routes (FR-6 Group B). Service-layer pre-flight ensure_list_not_archived(item_id) runs at top of each Group B controller handler before any write, guaranteeing atomic-pre-flight semantics. Rescinds v1's 'v1 freezes ONLY 4 routes' position per review_v1_architecture C1, review_v1_completeness COMP-H-003, review_v1_consistency C-005",
+      "blocking": false,
+      "status": "resolved_in_v2"
+    },
+    {
+      "id": "NC-2",
+      "question": "Scope of 'household 内成员' rule — admin-only or any household member?",
+      "conflict": "Input §2 says 'household 内成员' (household member). Existing CRUD routes use default BaseCrudController permission (any authenticated user whose household_id matches), NOT BaseAdminController",
+      "default_resolution": "Any authenticated household member can archive/unarchive. No admin role required. Consistent with existing routes that create/update/delete shopping lists",
+      "blocking": false,
+      "status": "resolved_with_default"
+    },
+    {
+      "id": "NC-3",
+      "question": "Exact event payload field names — list_id vs shopping_list_id?",
+      "conflict_original": "Spec text uses list_id/list_name; existing EventShoppingListData uses shopping_list_id. JSON consumers might pattern-match either name",
+      "v2_resolution": "RESOLVED — use the input's exact field names list_id and list_name (literal input compliance). New payload class lives in a new dedicated namespace; existing EventShoppingListData.shopping_list_id is unaffected. Resolves review_v1_completeness COMP-C-002. v1's 'use shopping_list_id' default was REVERSED",
+      "blocking": false,
+      "status": "resolved_in_v2_reversed_from_v1"
+    },
+    {
+      "id": "NC-4",
+      "question": "total_estimated_amount semantics — no price column exists",
+      "conflict": "Spec §5 says payload includes total_estimated_amount (如有 / if available). No price/cost/amount column on ShoppingListItem (verified)",
+      "default_resolution": "Field defaults to None. Forward-compat hook for future price-tracking feature. NOT computed from any existing column (no per-item price exists; quantity is the count, extras is free-form JSON not standardized). Coding phase MUST NOT attempt to compute this field in v1",
+      "blocking": false,
+      "status": "resolved_with_default"
+    },
+    {
+      "id": "NC-5",
+      "question": "ON DELETE behavior for archived_by_user_id FK",
+      "conflict_original": "When user who archived a list is deleted, what happens to archived_by_user_id?",
+      "v2_resolution": "RESOLVED — ON DELETE SET NULL declared explicitly in BOTH FR-1 (SQLAlchemy model: ForeignKey('users.id', ondelete='SET NULL')) AND FR-2 (Alembic migration: batch_op.create_foreign_key('fk_shopping_lists_archived_by_user_id', 'users', ['archived_by_user_id'], ['id'], ondelete='SET NULL')). FR-1 invariant loosened to one-way (archived_at IS NULL ⇒ archived_by_user_id IS NULL) to accommodate SET NULL behavior. Verified by SC-15 integration test. Resolves review_v1_architecture H1, review_v1_consistency C-001, review_v1_completeness COMP-H-002",
+      "blocking": false,
+      "status": "resolved_in_v2"
+    }
+  ],
+  "self_concerns": [
+    {
+      "id": "SCN-1",
+      "concern": "Translator dependency injection into ShoppingListService",
+      "v1_detail": "FR-11 required ShoppingListService.bulk_* methods to call self.t(...) for i18n translation, but the service constructor had no Translator",
+      "v2_resolution": "RESOLVED — translation moved to a global FastAPI exception handler in mealie/routes/handlers.py (FR-11 §5). ShoppingListService stays HTTP-free and translator-free. Resolves review_v1_architecture M1 and review_v1_consistency C-004. No residual concern",
+      "status": "resolved_in_v2"
+    },
+    {
+      "id": "SCN-2",
+      "concern": "Partial-mutation failure path for recipe-add/recipe-remove routes",
+      "v1_detail": "Recipe routes could create items then fail on the list-level update with 409, leaving partial mutation",
+      "v2_resolution": "RESOLVED — service-layer pre-flight ensure_list_not_archived(item_id) runs at top of each Group B controller handler (FR-6 #8-#11) BEFORE any write. Atomic-pre-flight semantics. No residual concern",
+      "status": "resolved_in_v2"
+    },
+    {
+      "id": "SCN-3",
+      "concern": "RepositoryShoppingListItem constructor — passing the parent repo",
+      "v2_resolution": "RESOLVED — constructor injection of parent_repo: RepositoryShoppingList is the SINGLE normative wiring per FR-8 (no 'or equivalent'). Factory repository_factory.py:323-332 updated to pass parent_repo=self.group_shopping_lists. No residual concern",
+      "status": "resolved_in_v2"
+    },
+    {
+      "id": "SCN-4",
+      "concern": "archived_by schema serialization extra cost",
+      "detail": "Adding archived_by: UserSummary | None to ShoppingListSummary.loader_options adds one more selectinload per list. For households with hundreds of lists, this is small N+1 risk. Existing loader_options at line 237 already eager-loads User via joinedload(ShoppingList.user); new archived_by eager-load is separate join (different FK)",
+      "recommended_resolution": "Acceptable in v1. Only loaded eagerly when needed. Since archived_by defaults to None and FK is nullable, join effectively becomes LEFT OUTER JOIN that is nearly free for active-list-heavy responses. Performance test in v1 not required; benchmark in v2 if reports surface",
+      "status": "open"
+    },
+    {
+      "id": "SCN-5",
+      "concern": "register_archive_handlers registration ordering in mealie/app.py",
+      "detail": "FR-11 §5 introduces global FastAPI exception handler. Registration call register_archive_handlers(app) MUST happen during app initialization. Existing register_debug_handler(app) is invoked in mealie/app.py (per handlers.py:18 showing it is the only other handler-registration function)",
+      "recommended_resolution": "If future contributor adds another handler-registration function and forgets to call it, new exception types fall through to FastAPI default 500 handler producing opaque errors. Mitigation: add integration smoke test that asserts fresh archive request on archived list returns 409 (not 500). SC-1 already covers this",
+      "status": "open"
+    }
+  ],
+  "implementation_summary": {
+    "new_files": [
+      "mealie/repos/repository_shopping_list_item.py",
+      "mealie/alembic/versions/<ts>_<rev>_add_shopping_list_archive_columns.py",
+      "mealie/alembic/versions/<ts>_<rev>_add_shopping_list_archive_notifier_options.py",
+      "tests/multitenant_tests/case_shopping_list_archive.py",
+      "tests/multitenant_tests/test_shopping_list_archive_household.py"
+    ],
+    "modified_files": [
+      "mealie/db/models/household/shopping_list.py",
+      "mealie/db/models/household/events.py",
+      "mealie/services/event_bus_service/event_types.py",
+      "mealie/schema/household/group_shopping_list.py",
+      "mealie/repos/repository_shopping_list.py",
+      "mealie/repos/repository_factory.py",
+      "mealie/services/household_services/shopping_lists.py",
+      "mealie/routes/households/controller_shopping_lists.py",
+      "mealie/services/scheduler/tasks/delete_old_checked_shopping_list_items.py",
+      "mealie/lang/messages/en-US.json",
+      "mealie/core/exceptions.py",
+      "mealie/routes/handlers.py",
+      "mealie/app.py",
+      "tests/fixtures/fixture_shopping_lists.py",
+      "tests/integration_tests/user_household_tests/test_group_shopping_lists.py",
+      "tests/integration_tests/user_household_tests/test_group_shopping_list_items.py",
+      "tests/multitenant_tests/test_multitenant_cases.py"
+    ],
+    "auto_regenerated": [
+      "frontend/app/lib/api/types/household.ts",
+      "frontend/app/lib/api/types/events.ts",
+      "mealie/schema/household/__init__.py",
+      "tests/utils/api_routes/__init__.py"
+    ]
+  },
+  "compliance_checklist": [
+    "All Python commands use uv run … (not raw python/pip)",
+    "Run task py:check (Ruff + mypy + pytest) before commit",
+    "Run task dev:generate after any Pydantic schema or EventTypes change; commit regenerated files",
+    "All new SQLAlchemy columns use FilterableColumn[…] wrapper per GHSA-8m57-7cv5-rjp8 / FR-1",
+    "Migrations use op.batch_alter_table(...) for SQLite + PostgreSQL portability",
+    "Only mealie/lang/messages/en-US.json touched among locale files; all others are Crowdin-managed",
+    "Repository methods inherit/call _filter_builder to preserve multitenancy scoping (FR-7 §2/§3 archive/unarchive UPDATEs explicitly include tenant clause in their WHERE)",
+    "Service methods stay free of HTTP concerns; HTTP translation lives in global exception handler at mealie/routes/handlers.py (FR-11 §5)",
+    "No hand-edits to frontend/app/lib/api/types/, mealie/schema/*/__init__.py, or tests/utils/api_routes/__init__.py — all autogen",
+    "Register global exception handler register_archive_handlers(app) in mealie/app.py during initialization (FR-11 §5)",
+    "PR title follows Conventional Commits (e.g. 'feat: add archive lifecycle to shopping lists')",
+    "PR description includes release notes and ADR-style rationale for repo-layer guard placement"
+  ]
+}

@@ -1,0 +1,201 @@
+{
+  "schema_version": "1.0",
+  "primary": "Add an automatic Meal Plan → Shopping List sync feature to Mealie: extend HouseholdPreferences with three opt-in fields (auto_sync_meal_plan_to_shopping, auto_sync_target_shopping_list_id, auto_sync_run_time) plus a LastAutoSyncedAt idempotency marker, add a per-household-timezone-aware scheduled task that runs every 30 minutes and at the household's configured run-time window pulls today's MealPlan recipes, consolidates ingredients via the existing ShoppingListService.bulk_create_items / merge_items pipeline, filters out foods flagged Food.is_pantry_staple (a NEW column on ingredient_foods), appends results to the household's chosen (or first active) shopping list with recipe_references, dispatches a new MealPlanAutoSyncedToShopping event on the existing event bus, and exposes a household-admin POST /api/households/preferences/auto-sync-shopping/run-now manual trigger. Multi-replica safety via DB row lock or LastAutoSyncedAt CAS; strict per-household tenant isolation.",
+  "intent_type": "add_feature",
+  "scope": [
+    "data_model",
+    "migration",
+    "schema",
+    "repo",
+    "service",
+    "api",
+    "scheduler",
+    "event_bus",
+    "i18n",
+    "tests",
+    "multitenant"
+  ],
+  "confidence": 0.93,
+  "hypotheses": [
+    {
+      "id": "H1",
+      "summary": "add_feature: end-to-end auto-sync of today's MealPlan recipes into a household-chosen ShoppingList on a per-household schedule, with pantry-staple skip, recipe_references back-link, event-bus dispatch, manual run-now trigger, and multi-replica idempotency.",
+      "indicators": [
+        "Spec §1 adds THREE new HouseholdPreferences fields (auto_sync_meal_plan_to_shopping bool, auto_sync_target_shopping_list_id UUID|null, auto_sync_run_time HH:MM) plus an implicit LastAutoSyncedAt marker — confirmed against mealie/db/models/household/preferences.py:16-44 which has none of these today.",
+        "Spec §2 specifies a NEW scheduled task file at mealie/services/scheduler/tasks/auto_sync_shopping.py, registered with a period of 30 minutes via the existing @scheduled / SchedulerRegistry pattern — confirmed against mealie/services/scheduler/scheduler_registry.py:8-59 which only exposes register_daily/hourly/minutely (NOT a 30-minute bucket).",
+        "Spec §2 step 5–6 mandates a 'consolidate by (food_id, unit_id) into existing unchecked item' algorithm — confirmed this maps to ShoppingListService.can_merge / merge_items / bulk_create_items at mealie/services/household_services/shopping_lists.py:45-71, 73-128, 154-223 (the spec/grounding call this 'consolidate_ingredients' but no such symbol exists; the consolidation is inline in bulk_create_items).",
+        "Spec §2 step 4 adds a NEW Food.is_pantry_staple column — confirmed missing from mealie/db/models/recipe/ingredient.py:153-192 (only a deprecated `on_hand` boolean exists on IngredientFoodModel at line 192; no `is_pantry_staple`). Also missing from mealie/schema/recipe/recipe_ingredient.py:92-115 (CreateIngredientFood/IngredientFood expose no staple field).",
+        "Spec §2 step 7 dispatches a NEW EventTypes.MealPlanAutoSyncedToShopping with payload (household_id, shopping_list_id, added_item_count, skipped_pantry_count) — confirmed the EventTypes enum at mealie/services/event_bus_service/event_types.py:13-60 has no such member, and the enum docstring (lines 17-22) explicitly warns 'any changes made here must also be reflected in the database (and likely requires a database migration)'.",
+        "Spec §3 adds a NEW POST /api/households/preferences/auto-sync-shopping/run-now endpoint gated to household-admin (can_manage_household) — confirmed mealie/routes/households/controller_household_self_service.py currently only has GET/PUT /preferences (lines 54-62) and no run-now-style endpoint; the spec's 'PATCH' nomenclature is a naming drift from the existing PUT (a minor schema/wording divergence noted in trace).",
+        "Spec §4 cross-domain work: NEW i18n keys auto-sync.no-meal-plan-today / auto-sync.no-target-list / auto-sync.already-synced-today must be added to en-US.json — confirmed mealie/lang/messages/en-US.json has no 'auto-sync' namespace today.",
+        "Spec §5 testing requirements span unit_tests/services_tests/scheduler/tasks/, integration_tests/, and multitenant_tests/ — confirms add_feature scope (NOT just a bug fix or refactor).",
+        "Spec implementation constraints explicitly forbid building a parallel scheduler, require reuse of ShoppingListService and event_bus_service, and require SELECT … FOR UPDATE SKIP LOCKED or LastAutoSyncedAt CAS to be multi-replica safe — confirms this is an additive feature on top of existing abstractions, not a refactor."
+      ],
+      "counter_indicators": [
+        "Spec mentions 'reuse case-3's possibly-fixed consolidate_ingredients' but no such function literally exists in the tree (verified via grep -i 'consolidate' across mealie/). The intent depends on a downstream case-3 deliverable that has not landed; H1 still holds because the consolidation behaviour is what's required, regardless of where it lives.",
+        "Spec mandates per-household timezone but Group/Household/HouseholdPreferences/GroupPreferences carry NO timezone column today (verified across mealie/db/models/group/preferences.py:1-37, mealie/db/models/household/preferences.py:1-44, mealie/db/models/household/household.py:1-98, mealie/db/models/group/group.py:1-112). H1 still primary — the feature must add that field or fall back to server TZ per spec §实现约束.",
+        "Mealie's scheduler currently uses asyncio in a single uvicorn worker (mealie/app.py:165-179 has workers=1) and there is no distributed lock primitive in the codebase. H1 still primary — spec §实现约束 explicitly imposes the multi-replica safety requirement on the new code."
+      ],
+      "verdict": "primary"
+    },
+    {
+      "id": "H2",
+      "summary": "scheduled_task_only: this is just a new scheduler task that mirrors the existing create_mealplan_timeline_events pattern; preferences/events/admin-route work is incidental glue.",
+      "indicators": [
+        "mealie/services/scheduler/tasks/create_timeline_events.py:25-134 is a direct prior-art template: a daily task that iterates groups → households → repos.meals.get_today(tz=...) → does per-recipe work → dispatches event_bus_service events. The auto-sync task structurally mirrors this.",
+        "The spec's §2 'scheduler' is the largest single section by line count and is the only section that is genuinely net-new code (preferences are an additive 3-field extension, the manual trigger is a 30-line route, the event is one enum value).",
+        "The 'task only' framing matches Mealie's preferred extension pattern documented in context/grounding.md §7.C: 'add task in services/scheduler/tasks/<name>.py + register in scheduler_registry.py + write unit+integration test'."
+      ],
+      "counter_indicators": [
+        "Spec §1 adds three NEW HouseholdPreferences fields + alembic migration — that is concretely data_model work, not 'incidental glue'.",
+        "Spec §2 step 4 adds a NEW Food.is_pantry_staple column — touches a different domain (recipe/ingredient) than the scheduler task itself, and requires admin-routes work per §4.",
+        "Spec §3 manual trigger is a NEW authenticated endpoint with its own response shape and auth check (can_manage_household) — distinct API surface, not glue.",
+        "Spec §2 step 7 adds a NEW event type which per mealie/services/event_bus_service/event_types.py:17-22 docstring requires a DB migration on subscriber columns — hidden cost that defeats the 'just a task' framing.",
+        "Subsumed by H1: the task is one slice of an add_feature, not the whole feature."
+      ],
+      "verdict": "secondary"
+    },
+    {
+      "id": "H3",
+      "summary": "automation_extension_of_existing_addRecipe: the feature is equivalent to programmatically invoking the existing POST /households/shopping/lists/{id}/recipe endpoint on a schedule.",
+      "indicators": [
+        "mealie/routes/households/controller_shopping_lists.py:256-272 already exposes add_recipe_ingredients_to_list which calls ShoppingListService.add_recipe_ingredients_to_list (services/household_services/shopping_lists.py:413-455) — which already does the recipe→ingredient→merge→shopping-list-item pipeline including recipe_references population.",
+        "The spec §2 step 2-3-5 sequence (pull recipes, consolidate, append with recipe_references) is exactly what add_recipe_ingredients_to_list does today."
+      ],
+      "counter_indicators": [
+        "Spec §2 step 4 (pantry-staple filter) is NOT implemented by add_recipe_ingredients_to_list; it requires a new pre-filter on ingredients before passing them to the service.",
+        "Spec §2 step 6 '累加 quantity if same (food_id, unit_id) and not checked' is the merge-into-existing-item behaviour of bulk_create_items, which add_recipe_ingredients_to_list does use — so this indicator supports reuse but does not collapse H1 into H3.",
+        "The auto-sync task must additionally pick the target list (default = first active), enforce LastAutoSyncedAt idempotency, run in the right TZ window, and dispatch a new event type — all outside the scope of the existing endpoint.",
+        "Subsumed by H1; H3 correctly identifies that ShoppingListService.add_recipe_ingredients_to_list is the right reuse seam but does not capture the full feature."
+      ],
+      "verdict": "secondary"
+    },
+    {
+      "id": "H4",
+      "summary": "global_admin_setting: a single server-wide toggle that, when on, syncs every household — no per-household configuration needed.",
+      "indicators": [
+        "The simplest possible reading of '自动管理一周购物' is a server-wide cron, no per-household opt-in."
+      ],
+      "counter_indicators": [
+        "Spec §1 explicitly places the three new fields on HouseholdPreferences (per-household scope), default false (opt-in per household), with a per-household target list and per-household run-time.",
+        "Spec §2 過濾條件 explicitly: '只處理 auto_sync_meal_plan_to_shopping = true 的 household' — per-household gating.",
+        "Spec §5 multitenant tests explicitly demand cross-household isolation of pantry-staple marks and meal-plan-to-shopping writes — incompatible with a global toggle.",
+        "Mealie's domain model is fundamentally multi-tenant (group → household → shopping_list); a global setting would violate the existing scoping invariants documented in context/grounding.md §2."
+      ],
+      "verdict": "rejected"
+    }
+  ],
+  "skeptic_challenges": [
+    {
+      "challenge": "Does the spec actually require adding a new timezone column, or can we reuse an existing one?",
+      "resolution": "Verified NO timezone column exists on Household, HouseholdPreferences, Group, GroupPreferences, or User by grepping mealie/db/models/group/ and mealie/db/models/household/ for 'timezone|tz_' (zero matches). The only TZ-related references in models are in mealie/db/models/_model_utils/datetime.py:22-39 which strip TZ on store and re-add UTC on read. The existing create_mealplan_timeline_events task at mealie/services/scheduler/tasks/create_timeline_events.py:36 uses dateutil.tz.tzlocal() (server-process TZ) — and controller_mealplan.py:126 does the same for GET /mealplans/today. Spec §实现约束 'must use household configured timezone' therefore demands a NEW field. Surfaced as a sub-slice under scope:[data_model]."
+    },
+    {
+      "challenge": "Does Food.is_pantry_staple already exist? The alembic file 2024-06-22-10.17.03_32d69327997b_add_staple_flag_to_foods.py is named 'staple_flag'.",
+      "resolution": "Verified: the migration body (lines 24-46) adds a column named `on_hand`, NOT `is_pantry_staple`. The filename 'staple_flag' is a misnomer/legacy. mealie/db/models/recipe/ingredient.py:192 declares `on_hand: Mapped[bool] = mapped_column(Boolean, default=False)` and marks it Deprecated. The Pydantic schemas at mealie/schema/recipe/recipe_ingredient.py:92-115 do NOT expose on_hand. Therefore is_pantry_staple is genuinely a NEW column; case-5 must add it via alembic + model + schema + admin-route exposure."
+    },
+    {
+      "challenge": "Does a function literally called `consolidate_ingredients` exist that case-5 can reuse?",
+      "resolution": "Verified: grep -i 'consolidate' across mealie/ returns only inline variable names (consolidated_create_items at services/household_services/shopping_lists.py:163-177, consolidated_update_items at 227-252) and unrelated query_filter consolidation. No top-level consolidate_ingredients function exists. The spec/grounding wording is loose; the de-facto consolidation lives in ShoppingListService.can_merge (lines 45-71), merge_items (73-128), and bulk_create_items (154-223). The auto-sync task should call bulk_create_items (or add_recipe_ingredients_to_list which wraps it). If case-3 lands a refactored extract, the auto-sync task should call whatever the refactor exposes. Surfaced as a downstream-coupling note in trace.md."
+    },
+    {
+      "challenge": "The scheduler has no 30-minute bucket — register_minutely is misnamed (runs every 5 min per scheduler_service.py:16 MINUTES_5). How does '30 minutes' get implemented?",
+      "resolution": "Verified at mealie/services/scheduler/scheduler_service.py:15-17 the only buckets are MINUTES_DAY (1440), MINUTES_HOUR (60), and MINUTES_5 (5) — exposed as register_daily/hourly/minutely (the latter being a misnomer). Options for the auto-sync task: (a) register on minutely (5-min) and self-gate via a 'is current 30-min slot the configured run-time?' check inside the task; (b) extend SchedulerRegistry/SchedulerService with a new bucket. Spec §实现约束 forbids 'building a parallel scheduler' so option (a) reusing register_minutely is preferred, with an internal time-window check. Either way the LastAutoSyncedAt + 24h gate provides the once-per-day correctness. Flagged as design-decision in trace.md."
+    },
+    {
+      "challenge": "Will multi-replica safety actually be needed? Mealie ships single-uvicorn-worker (app.py:177 workers=1) and the scheduler is in-process asyncio.",
+      "resolution": "Verified: mealie/app.py:165-179 main() uses workers=1, and SchedulerService.start at mealie/services/scheduler/scheduler_service.py:21-28 attaches tasks to asyncio.create_task. In single-replica deployments, no concurrent invocation can happen. Spec §实现约束 nonetheless mandates multi-replica safety ('多副本部署考虑'). The required mechanisms — SELECT … FOR UPDATE SKIP LOCKED or LastAutoSyncedAt CAS — both work at the DB level so they remain valid even under single-replica. Implementation cost: add an updated_at-guarded UPDATE statement and abort if zero rows updated. Acceptable; H1 stands."
+    },
+    {
+      "challenge": "Why not piggyback on the existing create_mealplan_timeline_events scheduled task instead of adding a new file?",
+      "resolution": "create_mealplan_timeline_events runs daily (registered at mealie/app.py:130 via register_daily). The auto-sync task must run every 30 minutes (per spec §2) so that household run-times other than the server's daily-run hour are honoured. Combining the two would either (a) over-trigger timeline events or (b) under-trigger auto-sync. Therefore a separate file at mealie/services/scheduler/tasks/auto_sync_shopping.py per spec §2 is correct."
+    },
+    {
+      "challenge": "The spec uses 'PATCH /api/households/preferences' but the existing route at controller_household_self_service.py:58 is PUT — naming mismatch?",
+      "resolution": "Verified: the existing route is PUT. The spec's 'PATCH' is loose phrasing for 'update'. UpdateHouseholdPreferences (mealie/schema/household/household_preferences.py:10-23) is the schema used; adding three new fields there automatically extends the PUT body. The implementation should either (a) add the three fields to UpdateHouseholdPreferences and let PUT carry them (cleanest, matches existing pattern) or (b) introduce a new partial-update PATCH only if PUT semantics break the i18n/test contract. Choice deferred to coding agent; trace.md notes this as 'naming drift not behavior gap'."
+    }
+  ],
+  "verifications": [
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/db/models/household/preferences.py:16-44 — HouseholdPreferencesModel currently has private_household, show_announcements, lock_recipe_edits_from_other_households, first_day_of_week, recipe_public, recipe_show_nutrition, recipe_show_assets, recipe_landscape_view, recipe_disable_comments, recipe_disable_amount. No auto_sync_*, no timezone, no LastAutoSyncedAt. Confirms three+ NEW columns needed."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/schema/household/household_preferences.py:10-40 — UpdateHouseholdPreferences/CreateHouseholdPreferences/SaveHouseholdPreferences/ReadHouseholdPreferences hierarchy; three new fields added to UpdateHouseholdPreferences cascade automatically through Create/Save/Read."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/db/models/recipe/ingredient.py:153-192 — IngredientFoodModel has id, group_id, group, households_with_ingredient_food, name, plural_name, description, ingredients, aliases, extras, label_id, label, name_normalized, plural_name_normalized, on_hand (Deprecated). No is_pantry_staple. Confirms NEW column needed."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/scheduler/scheduler_registry.py:8-59 — SchedulerRegistry exposes only register_daily/hourly/minutely with corresponding _daily/_hourly/_minutely lists. No 30-minute bucket; auto-sync must reuse minutely (every 5 min per scheduler_service.py:16-17 MINUTES_5) and self-gate."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/scheduler/scheduled_func.py:1-18 — ScheduledFunc dataclass holds id, name, hour, minutes, callback, max_instances=1, replace_existing=True, args=[]. Confirms the registration shape any new task must follow."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/scheduler/tasks/create_timeline_events.py:25-134 — direct prior-art template: iterate groups → households via PaginationQuery(page=1, per_page=-1), construct repos = get_repositories(session, group_id=..., household_id=...), call repos.meals.get_today(tz=local_tz), gather recipes, dispatch event_bus_service.dispatch(integration_id=DEFAULT_INTEGRATION_ID, group_id, household_id, event_type, document_data). Auto-sync follows the same shape but writes to shopping_lists instead of recipe_timeline_events."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/household_services/shopping_lists.py:45-71 (can_merge), 73-128 (merge_items), 154-223 (bulk_create_items), 323-411 (get_shopping_list_items_from_recipe), 413-455 (add_recipe_ingredients_to_list) — collectively the de-facto 'consolidate_ingredients' pipeline that the auto-sync task must reuse. add_recipe_ingredients_to_list is the highest-level seam and handles recipe_references population."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/event_bus_service/event_types.py:13-60 — EventTypes enum has 22 members (test_message through label_deleted) but no MealPlanAutoSyncedToShopping. Docstring at lines 17-22 mandates a DB migration when adding a new enum value (subscriber repository field). Also at lines 88-176 EventDocumentDataBase + concrete data shapes — auto-sync needs a NEW EventMealPlanAutoSyncedData(EventDocumentDataBase) with household_id, shopping_list_id, added_item_count, skipped_pantry_count."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/event_bus_service/event_bus_service.py:42-96 — EventBusService.dispatch(integration_id, group_id, household_id, event_type, document_data, message='') is the dispatch API the auto-sync task must call. Loops per-household when household_id is None — confirms tenant isolation is structurally enforced."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/routes/households/controller_household_self_service.py:1-92 — HouseholdSelfServiceController @ 20-91 currently has get_logged_in_user_household, get_household_recipe, get_household_members, get_household_preferences (line 54 GET /preferences), update_household_preferences (line 58 PUT /preferences), set_member_permissions, get_statistics. NEW POST /preferences/auto-sync-shopping/run-now must be added here, gated by self.checks.can_manage_household() (already implemented at routes/_base/checks.py:23-25)."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/routes/unit_and_foods/foods.py:24-78 — IngredientFoodsController inherits BaseUserController (not BaseAdminController). update_one @ line 69-73 PUT /foods/{item_id} is gated by self.checks.can_organize() (mealie/routes/_base/checks.py:38). Spec §4 says 'allow admins to mark pantry_staple'. Either (a) extend the existing PUT to accept is_pantry_staple via CreateIngredientFood + can_organize, or (b) add an admin-only PATCH /admin/foods/{id}/pantry-staple under mealie/routes/admin/. Spec wording 'admin/foods routes' suggests (b); the existing admin routes pattern is in mealie/routes/admin/admin_management_households.py:22-91 (BaseAdminController + APIRouter prefix='/households')."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/repos/repository_meals.py:11-21 — RepositoryMeals(HouseholdRepositoryGeneric) has get_today(tz=UTC) that filters by GroupMealPlan.date == today AND GroupMealPlan.household_id == self.household_id. The auto-sync task calls this with the household's configured TZ. Already returns ReadPlanEntry with .recipe_id, .recipe, etc. (mealie/db/models/household/mealplan.py:55-77 model + mealie/schema/meal_plan/new_meal.py ReadPlanEntry)."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/lang/messages/en-US.json:1-95 (verified file is JSON not YAML; grounding §5 incorrect on file format) — top-level keys generic/recipe/mealplan/user/group/exceptions/notifications/datetime/emails. No 'auto-sync' namespace; NEW keys auto-sync.no-meal-plan-today / no-target-list / already-synced-today must be added there (en-US only per .github/copilot-instructions.md)."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/alembic/versions/2024-09-02-21.39.49_be568e39ffdf_added_household_recipe_lock_setting_and_.py:21-75 — direct precedent for the upcoming HouseholdPreferences migration: op.add_column('household_preferences', sa.Column(...nullable=True)) + populate_defaults() with Postgres/SQLite TRUE/FALSE branching + downgrade with drop_column. Reusable verbatim for auto_sync_* fields."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/alembic/versions/2024-06-22-10.17.03_32d69327997b_add_staple_flag_to_foods.py:1-46 — direct precedent for adding is_pantry_staple to ingredient_foods: op.batch_alter_table('ingredient_foods') → add_column nullable=True → UPDATE … SET … = FALSE/0 → alter_column nullable=False. Reusable for is_pantry_staple."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/app.py:124-144 start_scheduler() — registers tasks via SchedulerRegistry.register_daily/minutely/hourly. NEW auto_sync_shopping task must be added to one of these calls (probably register_minutely since the spec's 30-min interval is closest to the 5-min minutely bucket with internal gating)."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "tests/unit_tests/services_tests/scheduler/tasks/ (path verified by Get-ChildItem) — existing test files: test_create_timeline_events.py, test_delete_old_checked_shopping_list_items.py, test_post_webhook.py, test_purge_expired_share_tokens.py, test_purge_group_exports.py. NOTE: spec wording 'tests/unit_tests/services/scheduler/test_auto_sync.py' is a path drift; actual convention is tests/unit_tests/services_tests/scheduler/tasks/test_auto_sync.py."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/db/models/household/shopping_list.py:51-98 (ShoppingListItem with food_id @ 78, unit_id @ 75, checked @ 65, recipe_references @ 87-89) and 26-48 (ShoppingListItemRecipeReference with recipe_id @ 37, shopping_list_item_id @ 33-35, recipe_quantity @ 39, recipe_scale @ 40, recipe_note @ 41) — confirms the (food_id, unit_id) merge key and the recipe_references back-link path required by spec §2 step 5-6."
+    },
+    {
+      "hypothesis": "H2",
+      "evidence": "mealie/services/scheduler/tasks/__init__.py:1-19 — task registration follows a simple from .file import func + __all__ pattern. Adding auto_sync_shopping is mechanically trivial (one line in __init__.py + one register_minutely call in app.py); supports the H2 'just a task' framing but does not subsume the cross-cutting changes captured by H1."
+    },
+    {
+      "hypothesis": "H3",
+      "evidence": "mealie/routes/households/controller_shopping_lists.py:256-261 — POST /households/shopping/lists/{item_id}/recipe calls ShoppingListService.add_recipe_ingredients_to_list which is the reuse seam for the auto-sync task. Confirms H3's reuse insight is correct but H3 cannot alone implement the feature (pantry filter, target-list-selection, idempotency, event dispatch all live outside that call)."
+    }
+  ],
+  "rounds_used": 1
+}

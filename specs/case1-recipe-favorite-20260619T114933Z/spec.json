@@ -1,0 +1,260 @@
+{
+  "schema_version": "1.0",
+  "metadata": {
+    "feature_id": "recipe-favorites-self-api",
+    "title": "Recipe Favorites — Self-Service API",
+    "writer_model": "copilot-cli-subagent",
+    "iterations": 1,
+    "needs_review": false
+  },
+  "summary": "Add self-service favorite APIs and recipe favorite metadata by reusing Mealie's existing users_to_recipes/UserToRecipe.is_favorite storage instead of creating a new user_favorite_recipe table. The selected conservative plan preserves legacy user-id favorite routes, adds missing self write wrappers, defines paginated self favorite listing with an explicit compatibility decision for the existing /self/favorites route, and requires non-N+1 hydration of favorited and favorite_count.",
+  "user_stories": [
+    {
+      "id": "US-1",
+      "priority": "P1",
+      "title": "Authenticated user favorites a recipe",
+      "description": "As a signed-in user, I can favorite a recipe visible to my group without knowing or sending my own user id.",
+      "acceptance": [
+        {"given": "an authenticated user and a visible recipe", "when": "they POST /api/users/self/favorites/{recipe_slug}", "then": "UserToRecipe.is_favorite is true for that user and recipe"},
+        {"given": "the favorite already exists", "when": "they POST the same route again", "then": "the response is successful and no duplicate association row is created"},
+        {"given": "a recipe outside the user's group visibility", "when": "they POST the self favorite route", "then": "the API returns 404"}
+      ]
+    },
+    {
+      "id": "US-2",
+      "priority": "P1",
+      "title": "Authenticated user unfavorites a recipe",
+      "description": "As a signed-in user, I can remove a favorite using a self route.",
+      "acceptance": [
+        {"given": "an authenticated user with a favorite", "when": "they DELETE /api/users/self/favorites/{recipe_slug}", "then": "the existing UserToRecipe row is updated to is_favorite=false"},
+        {"given": "no favorite exists", "when": "they DELETE the same route", "then": "the response is still successful"},
+        {"given": "a recipe outside the user's group visibility", "when": "they DELETE the self favorite route", "then": "the API returns 404"}
+      ]
+    },
+    {
+      "id": "US-3",
+      "priority": "P1",
+      "title": "User lists their favorites (paginated)",
+      "description": "As a signed-in user, I can list my favorited recipes with Mealie pagination semantics.",
+      "acceptance": [
+        {"given": "an authenticated user with favorites", "when": "they GET /api/users/self/favorites", "then": "the API returns a paginated recipe-summary collection"},
+        {"given": "pagination query parameters", "when": "the user requests a page", "then": "page, perPage, total, and items follow PaginationQuery/PaginationBase conventions"},
+        {"given": "other users have favorites", "when": "the current user lists favorites", "then": "only current-user visible favorites are included"},
+        {"given": "the current implementation already has /api/users/self/favorites returning rating summaries", "when": "implementing this story", "then": "compatibility is explicitly resolved before changing the response model"}
+      ]
+    },
+    {
+      "id": "US-4",
+      "priority": "P1",
+      "title": "Recipe list/detail shows favorited and favorite_count",
+      "description": "As any recipe reader, I can see how many users favorited each recipe; authenticated users also see whether they favorited it.",
+      "acceptance": [
+        {"given": "an authenticated user who favorited a recipe", "when": "they GET /api/recipes or /api/recipes/{slug}", "then": "the recipe has favorited=true and favorite_count at least 1"},
+        {"given": "an authenticated user who did not favorite the recipe", "when": "they fetch the same recipe", "then": "favorited=false and favorite_count remains populated"},
+        {"given": "an unauthenticated request to supported public recipe reads", "when": "a recipe is returned", "then": "favorited=false and favorite_count is populated"},
+        {"given": "a recipe list with many items", "when": "favorites are hydrated", "then": "implementation avoids one query per recipe"}
+      ]
+    },
+    {
+      "id": "US-5",
+      "priority": "P2",
+      "title": "Existing favorite endpoints stay operational",
+      "description": "Existing user-id favorite routes continue to work while self routes are introduced.",
+      "acceptance": [
+        {"given": "an existing client using /api/users/{id}/favorites/{slug}", "when": "it adds or removes a favorite for the current user", "then": "behavior is unchanged"},
+        {"given": "a client attempts to mutate another user's favorites", "when": "the ids differ", "then": "existing permission checks still reject it"},
+        {"given": "self routes are used", "when": "they mutate favorites", "then": "they call the same repository/storage path as legacy routes"}
+      ]
+    },
+    {
+      "id": "US-6",
+      "priority": "P2",
+      "title": "Favorite data is cleaned with users/recipes",
+      "description": "Operators should not have orphan favorite rows after recipe or user deletion.",
+      "acceptance": [
+        {"given": "a favorited recipe is deleted", "when": "favorite list and recipe count queries run", "then": "deleted recipes are absent"},
+        {"given": "a user is deleted", "when": "repository queries run for remaining users", "then": "the deleted user's favorites do not affect favorite_count"},
+        {"given": "existing FK cascade behavior is insufficient", "when": "implementing", "then": "add the smallest migration needed to enforce cleanup on users_to_recipes"}
+      ]
+    }
+  ],
+  "functional_requirements": [
+    {
+      "id": "FR-001",
+      "text": "Favorite persistence MUST reuse users_to_recipes/UserToRecipe.is_favorite as canonical storage; do not add user_favorite_recipe in the default implementation.",
+      "requirement_type": "functional",
+      "code_references": [
+        {"path": "mealie/db/models/users/user_to_recipe.py", "symbols": ["UserToRecipe", "is_favorite"], "line_ranges": [[17, 30]]},
+        {"path": "mealie/alembic/versions/2024-03-18-02.28.15_d7c6efd2de42_migrate_favorites_and_ratings_to_user_.py", "symbols": ["upgrade"], "line_ranges": [[153, 194]]}
+      ]
+    },
+    {
+      "id": "FR-002",
+      "text": "Add authenticated self write endpoints POST and DELETE /api/users/self/favorites/{recipe_slug} that use self.user.id and never accept a user id from the caller.",
+      "requirement_type": "functional",
+      "code_references": [
+        {"path": "mealie/routes/users/crud.py", "symbols": ["UserController", "get_logged_in_user_favorites"], "line_ranges": [[19, 40]]},
+        {"path": "mealie/routes/users/ratings.py", "symbols": ["add_favorite", "remove_favorite"], "line_ranges": [[78, 86]]}
+      ]
+    },
+    {
+      "id": "FR-003",
+      "text": "POST favorite MUST be idempotent: create a UserToRecipe link if absent, otherwise update the existing row to is_favorite=true without duplicate rows.",
+      "requirement_type": "functional",
+      "code_references": [
+        {"path": "mealie/routes/users/ratings.py", "symbols": ["set_rating"], "line_ranges": [[54, 76]]},
+        {"path": "mealie/repos/repository_users.py", "symbols": ["RepositoryUserRatings.get_by_user_and_recipe"], "line_ranges": [[98, 101]]}
+      ]
+    },
+    {
+      "id": "FR-004",
+      "text": "DELETE favorite MUST be idempotent: if the user-recipe row exists, set is_favorite=false; if the favorite is already absent, return success without error for the idempotent state.",
+      "requirement_type": "functional",
+      "code_references": [
+        {"path": "mealie/routes/users/ratings.py", "symbols": ["set_rating", "remove_favorite"], "line_ranges": [[70, 86]]},
+        {"path": "mealie/repos/repository_users.py", "symbols": ["RepositoryUserRatings.get_by_user_and_recipe"], "line_ranges": [[98, 101]]}
+      ]
+    },
+    {
+      "id": "FR-005",
+      "text": "Favorite mutation MUST resolve recipes through group-scoped recipe lookup and return 404 for recipes not visible to the current user's group.",
+      "requirement_type": "functional",
+      "code_references": [
+        {"path": "mealie/routes/users/ratings.py", "symbols": ["group_recipes", "get_recipe_or_404"], "line_ranges": [[19, 42]]},
+        {"path": "mealie/routes/recipe/_base.py", "symbols": ["BaseRecipeController.group_recipes"], "line_ranges": [[37, 48]]},
+        {"path": "mealie/repos/repository_generic.py", "symbols": ["get_one", "_filter_builder"], "line_ranges": [[94, 102], [156, 179]]}
+      ]
+    },
+    {
+      "id": "FR-006",
+      "text": "Define and implement a paginated self favorite recipe-list contract for /api/users/self/favorites; because this path currently returns rating summaries, include an explicit compatibility decision before changing the response model.",
+      "requirement_type": "functional",
+      "code_references": [
+        {"path": "mealie/routes/users/crud.py", "symbols": ["get_logged_in_user_favorites"], "line_ranges": [[38, 40]]},
+        {"path": "mealie/schema/response/pagination.py", "symbols": ["PaginationQuery", "PaginationBase"], "line_ranges": [[46, 56]]},
+        {"path": "frontend/app/lib/api/user/users.ts", "symbols": ["getFavorites", "getSelfFavorites", "getSelfRatings"], "line_ranges": [[58, 75]]}
+      ]
+    },
+    {
+      "id": "FR-007",
+      "text": "Add favorited: bool and favorite_count: int to recipe list/detail schemas, defaulting to false and 0 when no authenticated user/favorites exist.",
+      "requirement_type": "functional",
+      "code_references": [
+        {"path": "mealie/schema/recipe/recipe.py", "symbols": ["RecipeSummary", "Recipe"], "line_ranges": [[116, 149], [182, 190]]},
+        {"path": "mealie/routes/recipe/recipe_crud_routes.py", "symbols": ["get_all", "get_one"], "line_ranges": [[340, 395], [415, 424]]}
+      ]
+    },
+    {
+      "id": "FR-008",
+      "text": "Recipe favorite hydration MUST compute current-user favorited from UserToRecipe.user_id + recipe_id + is_favorite and favorite_count from favorite rows for the recipe, counting only visible/group-appropriate data.",
+      "requirement_type": "functional",
+      "code_references": [
+        {"path": "mealie/repos/repository_recipes.py", "symbols": ["RepositoryRecipes.by_user", "RepositoryRecipes.column_aliases", "_get_rating_col_alias"], "line_ranges": [[36, 52], [72, 93]]},
+        {"path": "mealie/db/models/recipe/recipe.py", "symbols": ["RecipeModel.favorited_by"], "line_ranges": [[68, 74]]},
+        {"path": "mealie/repos/repository_users.py", "symbols": ["RepositoryUserRatings.get_by_user", "RepositoryUserRatings.get_by_recipe"], "line_ranges": [[82, 96]]}
+      ]
+    },
+    {
+      "id": "FR-009",
+      "text": "Recipe list query MUST avoid N+1 when adding favorited and favorite_count; use joined/aggregate query, correlated EXISTS, grouped subquery, or one batched lookup for all page item ids.",
+      "requirement_type": "non_functional",
+      "code_references": [
+        {"path": "mealie/routes/recipe/recipe_crud_routes.py", "symbols": ["get_all"], "line_ranges": [[367, 383]]},
+        {"path": "mealie/schema/recipe/recipe.py", "symbols": ["RecipeSummary.loader_options"], "line_ranges": [[168, 175]]},
+        {"path": "mealie/repos/repository_recipes.py", "symbols": ["RepositoryRecipes.column_aliases"], "line_ranges": [[40, 52]]}
+      ]
+    },
+    {
+      "id": "FR-010",
+      "text": "Existing /api/users/{id}/favorites/{slug} and /api/users/{id}/favorites behavior MUST remain operational for backward compatibility unless a separate migration task updates the frontend and generated API clients.",
+      "requirement_type": "functional",
+      "code_references": [
+        {"path": "mealie/routes/users/ratings.py", "symbols": ["get_favorites", "add_favorite", "remove_favorite"], "line_ranges": [[44, 86]]},
+        {"path": "frontend/app/components/Domain/Recipe/RecipeFavoriteBadge.vue", "symbols": ["toggleFavorite"], "line_ranges": [[53, 64]]},
+        {"path": "frontend/app/pages/user/[id]/favorites.vue", "symbols": ["query"], "line_ranges": [[30, 32]]}
+      ]
+    },
+    {
+      "id": "FR-011",
+      "text": "Tests MUST cover repository add/remove/list, self POST/DELETE/list, recipe response fields, anonymous favorited=false, cross-group 404, count changes, deletion cleanup, pagination, and multitenant isolation.",
+      "requirement_type": "functional",
+      "code_references": [
+        {"path": "tests/fixtures/fixture_users.py", "symbols": ["build_unique_user", "h2_user"], "line_ranges": [[17, 80]]},
+        {"path": "tests/fixtures/fixture_recipe.py", "symbols": ["recipe_ingredient_only", "recipes_ingredient_only"], "line_ranges": [[31, 80]]},
+        {"path": "tests/multitenant_tests/test_multitenant_cases.py", "symbols": ["test_multitenant_cases_get_all", "test_multitenant_cases_same_named_resources"], "line_ranges": [[22, 94]]},
+        {"path": "tests/integration_tests/user_recipe_tests/test_recipe_cross_household.py", "symbols": ["test_get_all_recipes_includes_all_households"], "line_ranges": [[45, 70]]}
+      ]
+    }
+  ],
+  "success_criteria": [
+    {"id": "SC-001", "text": "Self favorite POST is idempotent", "metric": "duplicate POST result", "threshold": "second POST returns success and row count for (user_id, recipe_id) remains 1"},
+    {"id": "SC-002", "text": "Self favorite DELETE is idempotent", "metric": "duplicate DELETE result", "threshold": "second DELETE returns success and recipe is not favorited"},
+    {"id": "SC-003", "text": "Self favorite list is paginated", "metric": "response contract", "threshold": "items, page, perPage, and total match PaginationBase for at least 3 favorites across 2 pages"},
+    {"id": "SC-004", "text": "GET /api/recipes p95 latency does NOT regress vs baseline after adding favorited/favorite_count (no N+1)", "metric": "p95 latency or query-count test on a seeded page", "threshold": "≤10% p95 regression or bounded query count independent of page size"},
+    {"id": "SC-005", "text": "Recipe detail/list metadata is correct", "metric": "response field assertions", "threshold": "favoriting user sees favorited=true; other/anonymous users see favorited=false; all see correct favorite_count"},
+    {"id": "SC-006", "text": "Tenant isolation holds", "metric": "integration/multitenant tests", "threshold": "cross-group favorite attempts return 404 and cross-tenant favorites do not leak"},
+    {"id": "SC-007", "text": "Backward compatibility holds", "metric": "legacy route regression tests", "threshold": "existing /api/users/{id}/favorites add/remove/list still pass"}
+  ],
+  "key_entities": [
+    {
+      "name": "Extended UserToRecipe",
+      "description": "Existing association model in users_to_recipes and canonical favorite entity for this spec.",
+      "fields": ["user_id", "recipe_id", "rating", "is_favorite", "id", "created_at", "updated_at/update_at"]
+    },
+    {
+      "name": "Recipe favorite metadata",
+      "description": "Response-only fields on RecipeSummary/Recipe for favorite state and aggregate count.",
+      "fields": ["favorited", "favorite_count"]
+    },
+    {
+      "name": "Self favorite recipe list",
+      "description": "Paginated RecipeSummary collection filtered to the current user's visible favorites.",
+      "fields": ["items", "page", "perPage", "total", "totalPages", "next", "previous"]
+    }
+  ],
+  "edge_cases": [
+    {"description": "Idempotent POST of an already-favorited recipe", "handling": "Return success and keep one existing UserToRecipe row with is_favorite=true."},
+    {"description": "DELETE of a non-favorited recipe", "handling": "Return success and leave/ensure favorited=false."},
+    {"description": "Recipe in another group", "handling": "Return 404 using group-scoped recipe lookup."},
+    {"description": "Recipe cascade-deleted", "handling": "Deleted recipes are absent from favorite lists/counts; add FK cascade migration only if current constraints are insufficient."},
+    {"description": "Unauthenticated GET /api/recipes", "handling": "Return favorited=false and populated favorite_count where public recipe reads are supported."},
+    {"description": "Existing /api/users/self/favorites route response conflict", "handling": "Resolve compatibility explicitly before changing generated clients or response models."}
+  ],
+  "assumptions": [
+    "UserToRecipe.is_favorite is canonical because Mealie already migrated old favorites into users_to_recipes.",
+    "Existing /api/users/{id}/favorites/{slug} endpoints will remain operational for backward compatibility.",
+    "The backend API root includes /api; route decorators may show paths relative to /users.",
+    "Frontend migration is out of scope, but backend changes must avoid breaking existing UI favorite badge/page behavior.",
+    "favorite_count follows recipe endpoint visibility/group scoping, not global cross-group counting."
+  ],
+  "out_of_scope": [
+    "Creating a new user_favorite_recipe table in the default plan.",
+    "Frontend changes to switch UI from /users/{id}/favorites/{slug} to /users/self/favorites/.",
+    "Manually editing generated TypeScript API types.",
+    "Reworking ratings beyond preserving favorite/rating coexistence in UserToRecipe.",
+    "Changing non-English translation files.",
+    "Adding household-level/shared favorites."
+  ],
+  "self_concerns": [
+    {
+      "location": "US-3/FR-006",
+      "concern": "Current /api/users/self/favorites returns rating summaries, while the input asks for paginated recipes.",
+      "evidence_gap": "Needs reviewer/API owner decision on breaking, aliasing, or renaming the recipe-list contract."
+    },
+    {
+      "location": "US-6/FR-001",
+      "concern": "Migration/FK cascade behavior for users_to_recipes may not clean rows on all supported databases.",
+      "evidence_gap": "Inspected migration shows FKs but not ondelete cascade; implementation must verify current DB behavior before adding migration."
+    },
+    {
+      "location": "US-4/FR-008",
+      "concern": "favorite_count visibility semantics are not explicit in current code.",
+      "evidence_gap": "Spec assumes group/recipe endpoint visibility, but product may want global or household-scoped counts."
+    },
+    {
+      "location": "US-4/FR-007",
+      "concern": "Unauthenticated recipe route handling may need optional-auth wiring not fully inspected here.",
+      "evidence_gap": "Need implementation-time verification of public recipe endpoints and try_get_current_user dependencies."
+    }
+  ]
+}

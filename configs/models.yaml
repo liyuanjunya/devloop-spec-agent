@@ -1,0 +1,27 @@
+# Cross-company model routing.
+# Writer and Reviewer MUST be from different companies.
+# Anthropic ↔ OpenAI is the only supported pair (per design v7).
+
+routes:
+  - writer: claude-opus-4-7
+    reviewer: gpt-5.5
+
+  - writer: gpt-5.5
+    reviewer: claude-opus-4-7
+
+# Per-stage default model assignment (writer-side model choice).
+# When primary_model is set, all writer-side stages use it.
+stage_defaults:
+  preflight: null              # no LLM
+  repo_skeleton: null          # no LLM
+  intent_analyzer: primary
+  intent_skeptic: cross_review # MUST be cross-company
+  intent_verifier: primary
+  explorer: primary            # all 5 explorers
+  consolidator: primary
+  plan_generator: primary
+  plan_evaluator: cross_review # MUST be cross-company
+  plan_selector: primary
+  writer: primary
+  self_reflector: primary      # writer self-reflects
+  reviewer: cross_review       # all 4 reviewers

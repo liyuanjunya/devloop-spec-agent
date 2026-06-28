@@ -1,0 +1,8 @@
+{
+  "description": "Add user comments on product pages",
+  "repo": "tests/fixtures/sample_repo",
+  "tags": ["add_feature", "crud", "backend"],
+  "min_fr_count": 2,
+  "min_user_stories": 1,
+  "expected_intent_type": "add_feature"
+}

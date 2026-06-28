@@ -1,0 +1,177 @@
+{
+  "schema_version": "1.0",
+  "feature_id": "case5-live-iter1-20260619T175133Z",
+  "iteration": 2,
+  "judge_model": "claude-opus-4.7",
+  "verdict": "REWRITE_REQUIRED",
+  "summary": "v2 still has 3 critical + 3 high deduped actions across 4 axes (was 7 critical+high in v1). The dominant defect is CAS-after-side-effects, raised by ARCH/COMP/CONS/EXEC simultaneously (6 of 7 critical+high findings collapse to one root cause). Apply META-V2-001 through META-V2-007 to clear critical+high; META-V2-008 through META-V2-012 for polish/traceability. Bump metadata.iterations to 3. No regressions vs v1.",
+  "actions": [
+    {
+      "id": "META-V2-001",
+      "priority": 1,
+      "severity": "critical",
+      "affected_axes": ["architecture", "completeness", "executability", "consistency"],
+      "source_issue_ids": ["NEW-ARCH-C-1", "COMP-C-010", "C2-001", "C2-002", "EXEC-C-001", "EXEC-C-002"],
+      "description": "FR-011/FR-012 in v2 puts `bulk_create_items` + recipe-reference update + event dispatch BEFORE the conditional CAS UPDATE on `last_auto_synced_at`. The losing replica or a non-concurrent second invocation on the same day still runs `merge_items` which sums quantities (`shopping_lists.py:96`), so it doubles quantities and dispatches a duplicate event before observing it lost the race. The edge case explicitly accepts duplicate events; SC-007/SC-013/SC-017/SC-025 + US-2 AC2 say the opposite.",
+      "rationale": "All four review axes flag this as the single dominant defect. ARCH calls it CRITICAL (NEW-ARCH-C-1); COMP marks it CRITICAL (COMP-C-010); CONS lists two BLOCKING findings (C2-001 idempotency contradiction + C2-002 duplicate-event contradiction); EXEC marks both as CRITICAL (EXEC-C-001 + EXEC-C-002). 6 of 7 critical+high findings collapse to this single architectural choice.",
+      "suggested_action": "Re-order FR-011/FR-012 to: (1) resolve preconditions + load target/mealplan; (2) open DB transaction; (3) inside the txn issue the conditional UPDATE on `last_auto_synced_at` — if 0 rows affected, COMMIT the empty transaction and return without item writes or event dispatch; (4) if 1 row affected (CAS winner), build items + call `bulk_create_items` + update `recipe_references` + flush; (5) dispatch event via after-commit hook OR directly before commit; (6) commit. Any exception during steps 4-5 rolls back the entire transaction including the CAS UPDATE so the marker reverts and the next tick retries. Force-mode (run-now `force=True`) replaces step 3 with an unconditional UPDATE that still writes the marker but never returns 0 rows. Update SC-007 (zero items, zero events on second invocation), SC-013 (exactly one dispatch), SC-017 (no marker bump on no-op), SC-025 (no dispatch on empty mealplan), US-2 AC2 (no items, no event, marker stays). Rewrite the two-replica edge case: 'the CAS loser commits its empty transaction and returns; only the winner writes items or dispatches an event'. Remove the out-of-scope item about subscriber dedup tolerance.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-V2-002",
+      "priority": 1,
+      "severity": "critical",
+      "affected_axes": ["architecture", "executability"],
+      "source_issue_ids": ["NEW-ARCH-H-1", "EXEC-C-004"],
+      "description": "FR-024 specifies `op.batch_alter_table('group_event_notifier_options')` but the real table is `group_events_notifier_options` (verified at `mealie/db/models/household/events.py:16`, also at `mealie/alembic/versions/2026-03-26-20.48.28_cdc93edaf73d_add_mealplan_updated_and_deleted_to_.py:21`). v2 also does not require adding the new boolean to `GroupEventNotifierOptionsModel` ORM (events.py:15-53) or to the `GroupEventNotifierOptions` Pydantic schema (`mealie/schema/household/group_events.py:13-55`). `AppriseEventListener.get_subscribers` resolves the per-event subscription via `getattr(notifier.options, event.event_type.name)` (`event_bus_listeners.py:76-83`), so missing model/schema fields silently disable subscribers — the event is dispatched but no one subscribes.",
+      "rationale": "ARCH flags as HIGH (NEW-ARCH-H-1) and EXEC flags as CRITICAL (EXEC-C-004) with the same root cause. The migration column alone doesn't reach subscribers because the ORM/schema layers expose subscription state via attribute lookup, not column reflection. Both axes converge on the requirement to update all three layers in one PR.",
+      "suggested_action": "Update FR-024 to use the correct table name `group_events_notifier_options`. Add a new FR-028 [FR]: in `GroupEventNotifierOptionsModel` (events.py:15-53) add `mealplan_auto_synced_to_shopping: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)`. In `GroupEventNotifierOptions` (group_events.py:13-55) add `mealplan_auto_synced_to_shopping: bool = False`. The matching alembic migration column is in FR-024 step C with the corrected table name. SC-013 already verifies dispatch; add SC-027 verifying the per-event subscription column is reachable via `getattr(notifier.options, 'mealplan_auto_synced_to_shopping')`.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-V2-003",
+      "priority": 1,
+      "severity": "critical",
+      "affected_axes": ["architecture", "executability"],
+      "source_issue_ids": ["NEW-ARCH-M-1", "EXEC-C-003"],
+      "description": "SC-018 claims PATCH bodies with `last_auto_synced_at` are rejected because `MealieModel` has `ConfigDict(extra='forbid')`, but `MealieModel.model_config` only sets `alias_generator=camelize, populate_by_name=True` (verified at `mealie/schema/_mealie/mealie_model.py:53`). With no global `extra='forbid'`, pydantic's default behavior is `extra='ignore'` — the field is silently dropped, not rejected with 422.",
+      "rationale": "ARCH flags as MEDIUM (NEW-ARCH-M-1), EXEC flags as CRITICAL (EXEC-C-003) because the SC's pass/fail signal is wrong. Promoted to P1 because the verifier-facing SC is asserting behavior that won't happen with v2's instructions.",
+      "suggested_action": "Update FR-004 to require `model_config = ConfigDict(extra='forbid')` on `HouseholdPreferencesPartialUpdate` itself (NOT on `MealieModel` globally). Update SC-018 prose to cite the schema-level forbid: 'rejected with HTTP 422 because `HouseholdPreferencesPartialUpdate` declares `model_config = ConfigDict(extra='forbid')` (the field is not present on the schema, so pydantic raises validation_error[extra_forbidden]).' Globally setting `extra='forbid'` on MealieModel would break every other route in the codebase that relies on `extra='ignore'`.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-V2-004",
+      "priority": 2,
+      "severity": "high",
+      "affected_axes": ["architecture"],
+      "source_issue_ids": ["NEW-ARCH-H-2"],
+      "description": "FR-006 step 5 calls `self.repos.household_preferences.update(self.household_id, current)` where `current` is a `ReadHouseholdPreferences` instance loaded from the DB. `ReadHouseholdPreferences` (per v2 FR-005) includes `last_auto_synced_at`. The generic `repository_generic.update()` serializes the whole model and commits ALL fields, so a concurrent scheduler-written `last_auto_synced_at` can be clobbered with the stale value the PATCH route loaded.",
+      "rationale": "ARCH flags HIGH (NEW-ARCH-H-2). The fix is structural rather than just a guard: the PATCH route must NOT call a full-model update with a Read schema, no matter what the diff contains.",
+      "suggested_action": "Rewrite FR-006 step 5 to issue a column-set UPDATE that only writes `diff` keys: `session.execute(update(HouseholdPreferencesModel).where(HouseholdPreferencesModel.household_id == self.household_id).values(**diff)); session.commit()`. After commit, re-fetch the row via `self.repos.household_preferences.get_one(self.household_id, 'household_id')` and serialize via `ReadHouseholdPreferences.model_validate(...)` for the response. The diff dict, by construction (FR-004 `model_dump(exclude_unset=True)` on a schema that excludes `last_auto_synced_at`), can never contain the marker field. Document this invariant in FR-006 and in NC-003 `recommended_default`.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-V2-005",
+      "priority": 2,
+      "severity": "high",
+      "affected_axes": ["architecture", "completeness", "consistency", "executability"],
+      "source_issue_ids": ["NEW-ARCH-M-2", "COMP-H-011", "C2-003", "EXEC-H-002"],
+      "description": "FR-020 says the run-now response shape is exactly `{added_count, skipped_pantry_count, target_list_id, run_at}` (SC-012 enforces this), but also says precondition failures return HTTP 200 with those four fields PLUS an extra `detail` field. The two contracts contradict. Additionally, the input requires HTTP 204 (no body, 0 added) for the no-meal-plan integration scenario, which v2 does not specify.",
+      "rationale": "Three axes flag this. ARCH MEDIUM (NEW-ARCH-M-2), COMP HIGH (COMP-H-011), CONS HIGH (C2-003), EXEC HIGH (EXEC-H-002). Three high marks → promote to P2. The input is unambiguous: `input.md:67-71` says 'when no meal plan today returns 204 / 0 added'.",
+      "suggested_action": "Reconcile per input: HTTP 200 with EXACTLY `{added_count, skipped_pantry_count, target_list_id, run_at}` on success (already in SC-012). HTTP 204 No Content with NO body on precondition failure (no meal plan today OR no resolvable target list). The i18n keys (FR-022) surface only in server-side logs and event payloads, NEVER in the response body. Update FR-020, SC-012, US-9 AC1, FR-022 (drop the `detail` mention), and the related edge cases. Add SC-026 (or insert into FR-026 NFR) verifying the HTTP 204 path for no-meal-plan-today integration.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-V2-006",
+      "priority": 2,
+      "severity": "high",
+      "affected_axes": ["consistency", "executability"],
+      "source_issue_ids": ["C2-004", "EXEC-H-001"],
+      "description": "FR-001 declares `auto_sync_target_shopping_list_id: GUID NULL FK shopping_lists.id ON DELETE SET NULL` and Assumption #6 relies on the FK + delete action existing. FR-024 only adds the GUID column, not the FK constraint or the `ondelete='SET NULL'` action.",
+      "rationale": "CONS HIGH (C2-004), EXEC HIGH (EXEC-H-001). Same root cause across axes. The cited existing migration pattern at `mealie/alembic/versions/2024-02-23-16.15.07_2298bb460ffd_added_user_to_shopping_list.py:86` uses `batch_op.create_foreign_key(...)` but typically without ondelete; the spec must explicitly add ondelete.",
+      "suggested_action": "Update FR-024 step A to also call `batch_op.create_foreign_key('fk_household_preferences_auto_sync_target', 'shopping_lists', ['auto_sync_target_shopping_list_id'], ['id'], ondelete='SET NULL')` after adding the GUID column. The reverse in downgrade: `batch_op.drop_constraint('fk_household_preferences_auto_sync_target', type_='foreignkey')` before dropping the column. Add SC-028: after `alembic upgrade head`, `inspect(engine).get_foreign_keys('household_preferences')` includes one FK on `auto_sync_target_shopping_list_id` referencing `shopping_lists.id` with `options.ondelete='SET NULL'` (SQLAlchemy reflects this in `options` dict).",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-V2-007",
+      "priority": 2,
+      "severity": "high",
+      "affected_axes": ["executability"],
+      "source_issue_ids": ["EXEC wrong citation #1 (FR-002 cascade)"],
+      "description": "FR-002 claims `household_pantry_staples` is 'modeled byte-for-byte on `households_to_ingredient_foods`' (ingredient.py:21-27) and includes `ON DELETE CASCADE` on both FKs. The cited model has no `ondelete` argument anywhere. The deleted-food edge case + Assumption (implicit) rely on CASCADE.",
+      "rationale": "EXEC wrong-citation block flags this as a material citation defect. Without explicit CASCADE, deleting a food from `IngredientFoodsController.delete_one` will raise an IntegrityError on the `household_pantry_staples` row, contradicting the edge case behavior.",
+      "suggested_action": "Update FR-002 to explicitly state `sa.ForeignKey('households.id', ondelete='CASCADE')` and `sa.ForeignKey('ingredient_foods.id', ondelete='CASCADE')` on the new association table. Document that the parallel `households_to_ingredient_foods` (cited at L21-27) does NOT use CASCADE and this new table intentionally deviates to support the deleted-food edge case. Verified by grep: no existing Mealie table uses `ondelete='CASCADE'`, so this is a deliberate new pattern. Update FR-024 step B to declare CASCADE in the `create_table` call.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-V2-008",
+      "priority": 3,
+      "severity": "medium",
+      "affected_axes": ["completeness"],
+      "source_issue_ids": ["COMP-M-012"],
+      "description": "v2 only tests cross-household isolation within the same group. Input requirement 5 separately calls out 'cross group complete isolation' which v2 does not cover.",
+      "rationale": "COMP MEDIUM. Single-axis but matches the input bullet exactly.",
+      "suggested_action": "Add FR-029 [NFR] mirroring FR-027 but for cross-group: create household A in group G1 and household B in group G2; configure auto-sync for both; trigger task for both; assert (a) A cannot read or write any G2 meal plan, food, shopping list, or pantry-staple row; (b) `repos.meals.get_today` scoped to A's household never returns G2 rows; (c) `repos.group_shopping_lists.get_one` scoped to A's household returns None for any G2 list id. Add SC-029 asserting byte-equal G2 state before/after the A sync.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-V2-009",
+      "priority": 3,
+      "severity": "medium",
+      "affected_axes": ["executability"],
+      "source_issue_ids": ["EXEC-M-001"],
+      "description": "FR-009 says iterate households whose preference flag is true but does not pin the exact enumeration query or how to scope `AllRepositories` per household.",
+      "rationale": "EXEC MEDIUM. Concrete enough for v2 but reviewer notes the implementation seam is implicit.",
+      "suggested_action": "Update FR-009 to pin the enumeration: `enabled_households = session.execute(select(HouseholdModel).join(HouseholdPreferencesModel, HouseholdPreferencesModel.household_id == HouseholdModel.id).where(HouseholdPreferencesModel.auto_sync_meal_plan_to_shopping == True)).scalars().all()`. Per household, build a scoped repos instance: `repos = get_repositories(session, group_id=household.group_id, household_id=household.id)`. Cite `mealie/repos/all_repositories.py` (`get_repositories`) and add the household model citation.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-V2-010",
+      "priority": 3,
+      "severity": "medium",
+      "affected_axes": ["executability"],
+      "source_issue_ids": ["EXEC-M-002", "EXEC wrong citation #4"],
+      "description": "FR-022 + Assumption #3 + Self-Concern #3 all say 'Mealie ships with only the en-US locale'. The directory `mealie/lang/messages/` contains 40+ locale files (af-ZA, ar-SA, bg-BG, ca-ES, … en-US, en-GB, fr-FR, … zh-CN, etc.). The actionable convention per `.github/copilot-instructions.md` 'Translations' section: only modify en-US.json; all other locales are Crowdin-managed and MUST NOT be edited (PRs touching them are rejected).",
+      "rationale": "EXEC MEDIUM + wrong-citation #4. The false 'only en-US' claim could lead a reviewer to delete other locale files or add new locale files manually.",
+      "suggested_action": "Update FR-022 text: 'Mealie ships with 40+ locale files at `mealie/lang/messages/*.json` (en-US, en-GB, fr-FR, zh-CN, etc.); only en-US.json is editable by repository contributors. All other locales are Crowdin-managed per `.github/copilot-instructions.md` Translations section and MUST NOT be edited.' Update Assumption #3 and Self-Concern #3 the same way. SC-019 stays unchanged (it correctly asserts the en-US.json content only).",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-V2-011",
+      "priority": 3,
+      "severity": "medium",
+      "affected_axes": ["consistency"],
+      "source_issue_ids": ["C2-005"],
+      "description": "The 'no meal plan today' edge case says: 'a meal plan added later in the same day will trigger a real sync once the next scheduler tick falls inside the FR-009 window.' If the meal plan is added after the window closes (e.g., at 14:00 when the window was [07:30, 08:00)), no later scheduler tick falls inside the window today.",
+      "rationale": "CONS MEDIUM. Single-axis but a real overstatement that misleads reviewers.",
+      "suggested_action": "Tighten the edge case wording: 'a meal plan added later in the same household-local day triggers a real automatic sync only if (a) the meal plan is created before the current day's `[scheduled_local_instant, scheduled_local_instant + 30min)` window closes AND (b) the next 5-minute scheduler tick falls inside that window. If the meal plan is created after the window closes, only `POST /api/households/preferences/auto-sync-shopping/run-now` syncs that day; the next automatic sync is tomorrow's window.'",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-V2-012",
+      "priority": 4,
+      "severity": "low",
+      "affected_axes": ["consistency"],
+      "source_issue_ids": ["C2-006"],
+      "description": "Reciprocal-link mismatches in spec_v2.json: (a) FR-007 → SC-018 but SC-018 doesn't list FR-007; (b) SC-002 → FR-024 but FR-024 doesn't list SC-002; (c) SC-024 → FR-009 but FR-009 doesn't list SC-024; (d) SC-025 → FR-011 and FR-021 but FR-011/FR-021 don't list SC-025.",
+      "rationale": "CONS LOW. The trace-matrix validator treats one-direction as connected, so this is polish only.",
+      "suggested_action": "Make these links reciprocal in spec_v3.json: (a) SC-018.related_requirements adds 'FR-007'; (b) FR-024.related_success_criteria adds 'SC-002'; (c) FR-009.related_success_criteria adds 'SC-024'; (d) FR-011.related_success_criteria adds 'SC-025'; (e) FR-021.related_success_criteria adds 'SC-025'. Verify all other reciprocal pairs while editing.",
+      "conflicts_with": []
+    }
+  ],
+  "cross_axis_conflicts": [
+    {
+      "type": "convergence",
+      "description": "All 4 axes flag CAS-after-side-effects as the single dominant defect with identical recommended fixes.",
+      "resolution": "Merged in META-V2-001. ARCH suggests a 'separate claim/lease row' as an alternative; COMP/CONS/EXEC suggest single-transaction CAS-before-side-effects. The simpler design (single transaction, conditional UPDATE before writes) is sufficient because: (a) SQLAlchemy session txn rollback reverses the CAS on any exception in side-effect steps; (b) the WHERE clause `(last_auto_synced_at IS NULL OR < :today_midnight_utc)` is itself the lease; (c) no in-flight 'claiming' state is needed for a once-per-day per-household claim."
+    },
+    {
+      "type": "latent",
+      "description": "EXEC wrong-citation #1: FR-002 cites L21-27 of ingredient.py to justify `ON DELETE CASCADE` on the new table, but the cited model omits CASCADE.",
+      "resolution": "Resolved in META-V2-007. FR-002 v3 explicitly documents the deviation: 'the new association table adds ondelete=CASCADE on both FKs; the cited L21-27 parallel table omits CASCADE and the deviation is deliberate.' No existing Mealie table uses ondelete=CASCADE (grep-verified), so this is a documented new pattern."
+    },
+    {
+      "type": "latent",
+      "description": "C2-003 (CONS) wants `detail` added to the success schema; COMP-H-011 wants HTTP 204 on no-meal-plan per input.",
+      "resolution": "Merged in META-V2-005. Input wins: HTTP 204 with no body on no-meal-plan / no-target-list; HTTP 200 with the exact 4-key shape on success; no `detail` field anywhere in the response."
+    },
+    {
+      "type": "none_substantive",
+      "description": "No reviewer-vs-reviewer disagreement on whether any defect is real.",
+      "resolution": "Skip."
+    }
+  ],
+  "severity_rollup": {
+    "architecture": {"reviewer_counts": {"critical": 1, "high": 2, "medium": 2}, "meta_priorities": {"P1": 2, "P2": 2, "P3": 0}},
+    "completeness": {"reviewer_counts": {"critical": 1, "high": 1, "medium": 1}, "meta_priorities": {"P1": 1, "P2": 1, "P3": 1}},
+    "executability": {"reviewer_counts": {"critical": 4, "high": 3, "medium": 2}, "meta_priorities": {"P1": 3, "P2": 3, "P3": 2}},
+    "consistency": {"reviewer_counts": {"blocking": 2, "high": 2, "medium": 1, "low": 1}, "meta_priorities": {"P1": 1, "P2": 2, "P3": 1, "P4": 1}}
+  },
+  "v1_regression_check": {
+    "result": "no_regression",
+    "improved_count": 11,
+    "still_partial_count": 4,
+    "still_partial_actions": ["META-002 (CAS — fully fixed in META-V2-001)", "META-006 (event subscriber — fixed in META-V2-002)", "META-007 (run-now shape — fixed in META-V2-005)", "META-008 (PATCH marker safety — fixed in META-V2-004)", "META-011 (cross-group test — fixed in META-V2-008)"],
+    "newly_introduced_issues": []
+  }
+}

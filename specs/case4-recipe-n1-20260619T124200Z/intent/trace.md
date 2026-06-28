@@ -1,0 +1,39 @@
+# Intent confirmation trace — Case 4 (Recipe List N+1 Performance Refactor)
+
+## Inputs reviewed
+- Read `input.md`; it specifies a performance refactor for `GET /api/recipes` with three hard contracts: response fields 100% unchanged, query count O(N)→O(1), and a regression test asserting a constant query count.
+- Read `context/grounding.md`; it confirms Mealie's three-layer pattern (route → service → repository → ORM model) and explicitly flags `mealie/repos/repository_recipes.py` plus the per-household auto-filter as the data-access entry point. Section 8 already lists "recipe list N+1 with tags/categories/tools" as a known engineering debt.
+- Verified `C:\Users\v-liyuanjun\Downloads\mealie\mealie\repos\repository_recipes.py` and `C:\Users\v-liyuanjun\Downloads\mealie\mealie\routes\recipe\recipe_crud_routes.py` both exist and contain the symbols the spec targets.
+
+## Hypothesis generation
+1. **H1 primary (performance / refactor)**: The work is to eliminate the per-tool lazy load of `Tool.households_with_tool` and the joinedload-on-collection cartesian blow-up in `RepositoryRecipes.page_all` by chaining `selectinload(RecipeModel.tools).selectinload(Tool.households_with_tool)` (and converting the M2M joinedloads to selectinload) inside `RecipeSummary.loader_options()`. This keeps the response payload byte-identical while collapsing the recipes-list call to a fixed set of statements: COUNT + parent SELECT + one selectinload per M2M relationship + one chained selectinload for `households_with_tool`.
+2. **H2 rejected (stylistic refactor only)**: Convert `joinedload`→`selectinload` for code quality without a measurable contract. Rejected because the spec attaches an explicit, quantitative regression test (`count_large <= count_small + 3` AND `<= 5`) and demands before/after numbers in the PR description.
+3. **H3 rejected (application cache or denormalization)**: A Redis/in-memory cache or denormalized tag/category/tool columns would also flatten query count. Rejected because Section 5 of the input forbids application-layer caching, prohibits "lazy='dynamic' → list" tricks, and constrains the fix to the SQL layer.
+
+## Skeptic challenge
+The strongest alternative reading is that this DevLoop intent agent is being asked to confirm intent only, not to implement the Mealie refactor. That is true for this current task, so I am writing only `intent/confirmed.json`, `intent/trace.md`, and `exploration/data_perspective.md`. The confirmed downstream user intent remains a SQL-layer performance refactor.
+
+A second skeptic concern is whether the bottleneck is really `Tool.households_with_tool`. I verified the chain end-to-end:
+- `RecipeSummary.tools` is typed as `list[RecipeTool]` (schema/recipe/recipe.py:139).
+- `RecipeTool.households_with_tool` is `list[str]` with a `@field_validator("households_with_tool", mode="before")` that iterates `household.slug for household in v` (schema/recipe/recipe.py:83-95).
+- `RecipeSummary.loader_options()` joinedloads `RecipeModel.tools` but does NOT chain `selectinload(Tool.households_with_tool)` (schema/recipe/recipe.py:168-175).
+- `Tool.households_with_tool` is a default-lazy M2M `orm.relationship` (db/models/recipe/tool.py:54-56). Every recipe's every tool therefore triggers an extra SELECT during `pagination_response.model_dump(by_alias=True)` in `RecipeController.get_all` (routes/recipe/recipe_crud_routes.py:392).
+
+A third skeptic concern is whether switching collection loaders breaks pagination correctness or multi-tenant isolation. `selectinload` is the recommended SQLAlchemy strategy precisely because it preserves the parent query's LIMIT/OFFSET (it runs a follow-up `SELECT ... WHERE recipe_id IN (...)`), and the household/group filter is enforced by `RepositoryRecipes._build_recipe_filter` (repository_recipes.py:295-337) on the parent SELECT, independent of the loader strategy. Both spec invariants are preserved.
+
+## Codebase verification
+- `mealie/repos/repository_recipes.py:36-93` — `RepositoryRecipes` class header, `by_user`, `column_aliases`, `_get_last_made_col_alias`, `_get_rating_col_alias`. Confirms this is the recipe-list repo and that user-specific computed columns (rating, last_made) already exist as scalar subqueries — these must keep working.
+- `mealie/repos/repository_recipes.py:220-293` — `page_all` is the list method the spec targets. Line 277 attaches `q.options(*RecipeSummary.loader_options())` after pagination is added (line 274). This is the seam where loader strategy is decided.
+- `mealie/repos/repository_recipes.py:295-337` — `_build_recipe_filter` enforces `group_id` and `household_id` filters on the parent query; selectinload on child collections will not weaken these.
+- `mealie/repos/repository_generic.py:315-355` — Generic `page_all` shows the canonical three-statement skeleton: parent SELECT, COUNT subquery (lines 376-377), then loader options applied after pagination.
+- `mealie/schema/recipe/recipe.py:116-149` — `RecipeSummary` field set: `id, user_id, household_id, group_id, name, slug, image, recipe_servings, recipe_yield_quantity, recipe_yield, total_time, prep_time, cook_time, perform_time, description, recipe_category, tags, tools, rating, org_url, date_added, date_updated, created_at, updated_at, last_made`. All scalar fields are RecipeModel columns; relationships are `recipe_category`, `tags`, `tools`, and `user` (via `household_id` association_proxy).
+- `mealie/schema/recipe/recipe.py:168-175` — Current `RecipeSummary.loader_options()` uses joinedload for the three M2M collections and joinedload+load_only for user. Missing: chained selectinload for `Tool.households_with_tool`.
+- `mealie/schema/recipe/recipe.py:83-95` — `RecipeTool.households_with_tool` validator that triggers the lazy load.
+- `mealie/db/models/recipe/recipe.py:42-101,138` — `RecipeModel`: `recipe_category`, `tags`, `tools` are M2M via `recipes_to_categories`, `recipes_to_tags`, `recipes_to_tools`; `household_id` and `household` are AssociationProxies through `user`, so `joinedload(RecipeModel.user).load_only(User.household_id)` is required for the AssociationProxy resolution.
+- `mealie/db/models/recipe/tool.py:42-65` — `Tool.households_with_tool` M2M is default-lazy; this is the column the chained selectinload must target.
+- `mealie/routes/recipe/recipe_crud_routes.py:340-395` — `RecipeController.get_all` is the public `GET /api/recipes` controller; it calls `self.group_recipes.by_user(self.user.id).page_all(...)` (line 370) and serializes via `orjson.dumps(pagination_response.model_dump(by_alias=True))` (line 392), which is what triggers per-tool Pydantic validation.
+- `mealie/routes/recipe/_base.py:42-44` — `group_recipes` returns a household-unscoped (`household_id=None`) `RepositoryRecipes` so the list can return all recipes in a group, then filters down via query parameters. Multi-tenant isolation is enforced at the group level here and preserved by `_build_recipe_filter`.
+- `mealie/schema/recipe/recipe_tool.py:36-39` and `mealie/schema/recipe/recipe_ingredient.py:117-123` — Prior art: the same chained-selectinload pattern is already used to solve the symmetric N+1 in `RecipeToolOut` and `IngredientFood`, confirming this is Mealie's idiomatic fix.
+
+## Decision
+Confirmed primary intent: **performance refactor** of `GET /api/recipes` to eliminate the N+1 driven by `RecipeTool.households_with_tool` lazy loading and by joinedload-on-collection cartesian blow-up. The fix path is the `RecipeSummary.loader_options()` seam plus (optionally) inline options in `RepositoryRecipes.page_all`. Scope: `repo`, `schema`, `service`, `test`. The spec's invariants (response fields unchanged, pagination semantics preserved, multi-tenant household_id filter preserved, no application-layer cache) are all preserved by the proposed approach. Confidence: 0.95. Rounds used: 1.

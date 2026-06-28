@@ -1,0 +1,122 @@
+{
+  "schema_version": "1.0",
+  "case": "case-6",
+  "title": "Case-6 LLM Image-to-Recipe (security-hardened)",
+  "perspectives_merged": [
+    "data_perspective.md",
+    "api_perspective.md",
+    "test_perspective.md",
+    "history_perspective.md"
+  ],
+  "repo_root": "C:\\Users\\v-liyuanjun\\Downloads\\mealie",
+  "agreed_facts": [
+    {
+      "topic": "OpenAIService already supports image attachments via OpenAILocalImage",
+      "citation": "mealie/services/openai/openai.py:84-94 (OpenAILocalImage), 108-145 (init+client), 147-168 (_get_provider), 264-281 (_get_raw_response with response_format), 283-309 (get_response)",
+      "implication": "Reuse the existing service, do not build a parallel client."
+    },
+    {
+      "topic": "Image-provider gate is per-group DB-backed today (image_provider_enabled)",
+      "citation": "mealie/schema/group/ai_providers.py:117-130; AIProviderCreate.timeout: int = 300 at line 16"
+    },
+    {
+      "topic": "Existing endpoint is multi-image, returns slug, 400 on disable",
+      "citation": "mealie/routes/recipe/recipe_crud_routes.py:309-335"
+    },
+    {
+      "topic": "Existing orchestrator persists first image as original.webp cover",
+      "citation": "mealie/services/recipe/recipe_service.py:335-356 (create_from_images), data_service.write_image at 354-355"
+    },
+    {
+      "topic": "RecipeService.create_one is the canonical creation entry",
+      "citation": "mealie/services/recipe/recipe_service.py:163-187 (factory), 202-245 (create_one)"
+    },
+    {
+      "topic": "OpenAIRecipe -> Recipe mapper",
+      "citation": "mealie/services/recipe/recipe_service.py:599-622 (_convert_recipe)"
+    },
+    {
+      "topic": "Canonical safe-upload pattern: get_temporary_path() + uuid4() filename",
+      "citation": "mealie/routes/users/images.py:19-44 (gold standard), mealie/core/dependencies/dependencies.py:190-198"
+    },
+    {
+      "topic": "Pydantic v2 strict parse via OpenAIBase.parse_openai_response",
+      "citation": "mealie/schema/openai/_base.py:13-44"
+    },
+    {
+      "topic": "Prompts are plain .txt under prompts/{general,recipes}/ with dotted-name lookup + traversal guard",
+      "citation": "mealie/services/openai/openai.py:109 (PROMPTS_DIR), 170-204 (loader); mealie/services/openai/prompts/recipes/parse-recipe-image.txt:1-6"
+    },
+    {
+      "topic": "OpenAIService.get_response catch-all leaks str(e) of upstream exception",
+      "citation": "mealie/services/openai/openai.py:308-309"
+    },
+    {
+      "topic": "OpenAIBase._process_response DEBUG-logs the full raw response on parse failure",
+      "citation": "mealie/schema/openai/_base.py:33-35 (logger.debug(\"...Response: {response}\"))",
+      "risk": "Raw LLM output reaches DEBUG logs even when caller expects no leakage. MUST be sanitized for the new endpoint."
+    },
+    {
+      "topic": "RateLimitError exists but is never translated to HTTP 429",
+      "citation": "mealie/core/exceptions.py:57-62; controller handle_exceptions has no 429 branch (recipe_crud_routes.py:90-125)"
+    },
+    {
+      "topic": "No body-size limit, no MIME magic-sniff, no per-user rate-limiter exist in the repo",
+      "citation": "pyproject.toml has Pillow (line 10) + openai (line 43), no python-magic or filetype; routes have no size/magic checks"
+    },
+    {
+      "topic": "Only OPENAI_CUSTOM_PROMPT_DIR survives in AppSettings; other OPENAI_* migrated to DB rows by PR #7650",
+      "citation": "mealie/core/settings/settings.py:418-424"
+    },
+    {
+      "topic": "system/user message separation is already structurally correct in _get_raw_response",
+      "citation": "mealie/services/openai/openai.py:264-281"
+    },
+    {
+      "topic": "Only en-US locale file may be modified; others Crowdin-managed",
+      "citation": ".github/copilot-instructions.md (Translations + Common Gotchas)"
+    }
+  ],
+  "resolved_conflicts": [
+    {
+      "topic": "Single image vs multi-image",
+      "resolution": "Single image per intent §1; existing multi-image variant gets replaced (frontend break documented in NC)."
+    },
+    {
+      "topic": "Persist immediately vs draft",
+      "resolution": "Persist immediately (mirrors /create/url); review loop is the front-end edit page."
+    },
+    {
+      "topic": "MIME sniff library: python-magic vs filetype vs Pillow.verify",
+      "resolution": "filetype==1.2.0 (pure-python, ~30KB, no native dep). Pillow .verify still runs inside OpenAILocalImage for defense-in-depth."
+    },
+    {
+      "topic": "Rate-limit storage: in-process vs DB",
+      "resolution": "in-process asyncio.Lock-guarded dict; emit startup warning when UVICORN_WORKERS > 1; DB migration deferred."
+    }
+  ],
+  "blocking_decisions": [
+    {
+      "id": "NC-001",
+      "topic": "Persist immediately vs draft",
+      "default": "Persist immediately and return full Recipe (mirrors /create/url)."
+    },
+    {
+      "id": "NC-002",
+      "topic": "MIME-sniff library choice",
+      "default": "filetype==1.2.0 pure-python."
+    },
+    {
+      "id": "NC-003",
+      "topic": "Rate-limit storage",
+      "default": "in-process dict; log startup warning when UVICORN_WORKERS > 1."
+    }
+  ],
+  "self_concerns": [
+    {"id": "SC-1", "concern": "python-magic OS dep avoided by filetype"},
+    {"id": "SC-2", "concern": "Rate-limit per-process; multi-worker under-counts by N"},
+    {"id": "SC-3", "concern": "Prompt-injection mitigation is textual only; rely on cleaner.clean for HTML/script scrubbing"},
+    {"id": "SC-4", "concern": "60s timeout re-introduction reverses PR #6227; long vision calls may legitimately exceed it"},
+    {"id": "SC-5", "concern": "image (single) vs images (plural) is a public-API break; front-end coordination required"}
+  ]
+}

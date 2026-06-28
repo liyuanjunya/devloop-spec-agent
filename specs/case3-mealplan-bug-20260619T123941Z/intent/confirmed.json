@@ -1,0 +1,95 @@
+{
+  "schema_version": "1.0",
+  "primary": "Fix the Meal Plan to Shopping List consolidation bug so repeated occurrences of the same recipe ingredient are merged into one shopping list item whose quantity is accumulated, while preserving separation for different units and different food IDs.",
+  "intent_type": "bug_fix",
+  "scope": ["service", "repo", "test"],
+  "confidence": 0.96,
+  "hypotheses": [
+    {
+      "id": "H1",
+      "summary": "Bug fix for meal-plan-to-shopping-list ingredient consolidation: duplicate recipe occurrences should add quantities rather than overwrite or remain as separate duplicate rows.",
+      "indicators": [
+        "Bug report describes adding the same recipe from Monday dinner and Wednesday lunch to a shopping list.",
+        "Expected behavior says tomato and egg quantities should be 2x the single recipe amount.",
+        "Actual behavior says the list either contains only one serving quantity or two unmerged rows.",
+        "Task steps require reproduction, root-cause analysis, minimal fix, and regression tests."
+      ],
+      "counter_indicators": [
+        "The input includes an optional bug injection patch, so the underlying code may already be correct on some baselines.",
+        "The report mentions two possible symptoms, so the exact root cause is not yet predetermined."
+      ],
+      "verdict": "primary"
+    },
+    {
+      "id": "H2",
+      "summary": "Add or improve integration test coverage for meal plan to shopping list conversion and ingredient merge edge cases.",
+      "indicators": [
+        "The first requested step is to add a failing integration test under tests/integration_tests/.",
+        "The regression section lists four required tests for single occurrence, multiple occurrences, different units, and same display name with different food IDs."
+      ],
+      "counter_indicators": [
+        "Testing is framed as reproduction and regression for a bug fix, not the primary deliverable by itself.",
+        "The request explicitly requires a minimal code fix after root-cause analysis."
+      ],
+      "verdict": "secondary"
+    },
+    {
+      "id": "H3",
+      "summary": "Refactor the shopping list consolidation implementation around RepositoryShoppingItem or ShoppingListItem schemas.",
+      "indicators": [
+        "The input points to mealie/services/household_services/shopping_lists.py and its consolidation logic.",
+        "The constraints mention existing RepositoryShoppingItem / ShoppingListItem schema conventions."
+      ],
+      "counter_indicators": [
+        "The task explicitly says not to refactor surrounding code and to modify only the minimal code range.",
+        "The expected change is a bug fix of 1-3 functions plus tests, not a structural redesign."
+      ],
+      "verdict": "rejected"
+    }
+  ],
+  "skeptic_challenges": [
+    {
+      "challenge": "Could the user actually want only intent confirmation rather than implementation of the Mealie bug fix?",
+      "resolution": "Yes. This agent's task is specifically to confirm intent and write confirmed.json plus trace.md, not to modify Mealie code. The confirmed intent is nevertheless the downstream user's primary requested work: a bug fix for meal-plan shopping-list quantity consolidation."
+    },
+    {
+      "challenge": "Could the bug be about unit conversion or food matching rather than quantity accumulation?",
+      "resolution": "The input requires edge cases for different units and different food IDs, and the code's can_merge checks food_id and unit convertibility. However, the central scenario is repeated identical recipe ingredients and the explicit expected result is accumulated quantity, so consolidation/quantity accumulation remains the strongest intent."
+    }
+  ],
+  "verifications": [
+    {
+      "hypothesis": "H1",
+      "evidence": "input.md:13-18 — The bug report states that the same recipe appears twice in a meal plan and shopping list quantities should double, while actual behavior is undercounted or unmerged."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "input.md:32-43 — The required workflow directs root-cause analysis in mealie/services/household_services/shopping_lists.py and a minimal fix to the merge logic."
+    },
+    {
+      "hypothesis": "H2",
+      "evidence": "input.md:23-30 and input.md:45-53 — The user requires a failing reproduction test and four regression tests around repeated occurrences, units, and food identity."
+    },
+    {
+      "hypothesis": "H3",
+      "evidence": "input.md:40-42 and input.md:57-59 — The user explicitly forbids broad refactoring and requires using existing shopping list schemas, so a refactor intent is rejected."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/household_services/shopping_lists.py:45-71 — The file exists and contains can_merge, which decides whether shopping list items consolidate based on checked state, food_id, unit compatibility, and note."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/household_services/shopping_lists.py:73-128 — merge_items is a consolidation-style function that sums quantities or converts/merges quantities and combines recipe references."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/household_services/shopping_lists.py:162-177 and 180-203 — bulk_create_items consolidates new items and merges them into existing unchecked shopping list items."
+    },
+    {
+      "hypothesis": "H1",
+      "evidence": "mealie/services/household_services/shopping_lists.py:323-411 and 413-433 — recipe ingredients are converted into shopping list items, same-recipe duplicate ingredients are consolidated, and add_recipe_ingredients_to_list bulk-creates them."
+    }
+  ],
+  "rounds_used": 1
+}

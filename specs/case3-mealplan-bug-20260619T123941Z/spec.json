@@ -1,0 +1,232 @@
+{
+  "schema_version": "1.0",
+  "spec_id": "case3-mealplan-bug-20260619T123941Z/spec-v1",
+  "intent_type": "bug_fix",
+  "scope": ["service", "test"],
+  "selected_approach": "conservative",
+  "approach_rationale": "Smallest patch (1-2 lines) inside ShoppingListService.can_merge (mealie/services/household_services/shopping_lists.py:45-71) and/or ShoppingListService.merge_items (:73-128). Strict match for input intent which forbids surrounding refactors and mandates minimum scope. Lowest blast radius and preserves all pre-existing green tests in test_group_shopping_lists.py, test_group_shopping_list_items.py, and test_group_mealplan.py. See approach/selected.md.",
+  "target_files": {
+    "production_modified": ["mealie/services/household_services/shopping_lists.py"],
+    "tests_added": ["tests/integration_tests/user_household_tests/test_meal_plan_to_shopping_bug.py"]
+  },
+  "problem_statement": "When a user schedules the same recipe in multiple meal-plan slots and triggers 'Add Meal Plan to Shopping List', the resulting shopping list must contain exactly one row per (food_id, unit_id) whose quantity equals the recipe's per-ingredient quantity times the number of occurrences. Today this invariant is violated either by lost accumulation (single-recipe quantity shown) or lost consolidation (multiple unmerged rows). Defect lives in ShoppingListService.can_merge or ShoppingListService.merge_items in mealie/services/household_services/shopping_lists.py.",
+  "user_stories": [
+    {
+      "id": "US-1",
+      "title": "复现 (Reproduce)",
+      "as_a": "Mealie developer fixing this bug",
+      "i_want": "an integration test that reliably reproduces the meal-plan-to-shopping-list consolidation failure",
+      "so_that": "the regression cannot recur silently and the fix has a measurable acceptance signal",
+      "acceptance_criteria": [
+        "A new test file tests/integration_tests/user_household_tests/test_meal_plan_to_shopping_bug.py exists.",
+        "The test test_meal_plan_to_shopping_list_accumulates_duplicate_recipe_ingredients creates food_tomato and food_egg via unique_user.repos.ingredient_foods.create(SaveIngredientFood(name=..., group_id=unique_user.group_id)).",
+        "It creates two units via unique_user.repos.ingredient_units.create(SaveIngredientUnit(name='each' / 'tsp', group_id=unique_user.group_id)) with standard_unit=None (default).",
+        "It creates recipe_a via unique_user.repos.recipes.create(Recipe(... recipe_ingredient=[RecipeIngredient(food=food_tomato, unit=unit_each, quantity=2.0, note=food_tomato.name), RecipeIngredient(food=food_salt, unit=unit_tsp, quantity=1.0, note=food_salt.name)])).",
+        "It creates two meal-plan entries via POST /api/households/mealplans using CreatePlanEntry(date=monday, entry_type='dinner', recipe_id=recipe_a.id).model_dump(by_alias=True) with date string and recipeId string normalization (per tests/integration_tests/user_household_tests/test_group_mealplan.py:80-99).",
+        "It acquires the destination shopping list from the shopping_list fixture (tests/fixtures/fixture_shopping_lists.py:49-65).",
+        "It POSTs [ShoppingListAddRecipeParamsBulk(recipe_id=recipe_a.id), ShoppingListAddRecipeParamsBulk(recipe_id=recipe_a.id)] (two per-occurrence entries) to api_routes.households_shopping_lists_item_id_recipe(shopping_list.id) using utils.jsonify([... .model_dump()]).",
+        "GETs the shopping list and asserts exactly one item per food: tomato quantity == 4.0 (within 1e-6) with unit_id == unit_each.id and food_id == food_tomato.id; salt quantity == 2.0 with unit_id == unit_tsp.id and food_id == food_salt.id; total len(listItems) == 2.",
+        "This test FAILS on the buggy revision and PASSES after the US-3 fix."
+      ]
+    },
+    {
+      "id": "US-2",
+      "title": "根因 (Root-cause analysis)",
+      "as_a": "code reviewer",
+      "i_want": "the PR description to contain a structured root-cause analysis",
+      "so_that": "the failure mode, fix location, and adjacent contract are documented for future maintainers",
+      "acceptance_criteria": [
+        "PR description contains a '### Root cause' section answering, in order: (1) which function holds the bug with file path + symbol + exact line number(s); (2) whether the variant is overwrite-vs-accumulate (input.md附录 Variant A, merge_items line 96) or wrong merge key (Variant B, can_merge line 71); (3) boundary cases enumerated explicitly.",
+        "Boundary-case enumeration covers: same food_id + same unit_id ⇒ merge with sum; same food_id + different unit_id with both standard_unit=None ⇒ no merge; different food_id even with same display ⇒ no merge; food_id is None ⇒ merge falls back to note equality (can_merge line 71); recipe_scale accumulation through merge_items lines 109-126 yields one recipe_references entry with recipe_scale == N when same recipe_id is added N times.",
+        "Each answer cites at least one specific file:line reference inside mealie/services/household_services/shopping_lists.py."
+      ]
+    },
+    {
+      "id": "US-3",
+      "title": "最小修复 (Minimum-scope fix)",
+      "as_a": "Mealie maintainer",
+      "i_want": "a 1-2 line surgical patch inside mealie/services/household_services/shopping_lists.py that restores the canonical (food_id, unit_id) merge key and the to_item.quantity += from_item.quantity accumulation",
+      "so_that": "the reproduction passes and no other behavior is affected",
+      "acceptance_criteria": [
+        "Only mealie/services/household_services/shopping_lists.py is modified. No other production file changes.",
+        "Diff is confined to ShoppingListService.can_merge (lines 45-71) and/or ShoppingListService.merge_items (lines 73-128).",
+        "No new methods, no extracted helpers, no signature changes, no schema changes.",
+        "The non-unit-converted branch at line 96 contains to_item.quantity += from_item.quantity (NOT =).",
+        "can_merge rejects items with item1.food_id != item2.food_id (line 52) and uses bool(item1.food_id) or item1.note == item2.note as final return (line 71); display is NOT used as a merge key anywhere.",
+        "bulk_create_items (lines 154-223), bulk_update_items (lines 225-310), get_shopping_list_items_from_recipe (lines 323-411), and add_recipe_ingredients_to_list (lines 413-455) are unchanged.",
+        "All pre-existing tests in tests/integration_tests/user_household_tests/test_group_shopping_lists.py and tests/integration_tests/user_household_tests/test_group_shopping_list_items.py continue to pass with no modifications."
+      ]
+    },
+    {
+      "id": "US-4",
+      "title": "回归测试 (Regression tests)",
+      "as_a": "Mealie team member",
+      "i_want": "four additional regression tests in the same new test file that pin the exact merge contract",
+      "so_that": "any future change to consolidation logic is caught immediately",
+      "acceptance_criteria": [
+        "test_single_occurrence: schedule the recipe in exactly one meal-plan slot, add to fresh shopping list. Assert each ingredient appears once with quantity == ingredient.quantity (within 1e-6), food_id and unit_id set, exactly one recipe_references entry with recipe_scale == 1.0; len(listItems) == 2.",
+        "test_multiple_occurrences_same_unit: parametrized via @pytest.mark.parametrize('occurrences', [2, 3]). Schedule the recipe N times in distinct meal-plan slots, add via N per-occurrence bulk entries. Assert each ingredient appears once with quantity == ingredient.quantity * N, exactly one recipe_references entry with recipe_scale == float(N); len(listItems) == 2.",
+        "test_multiple_occurrences_different_units: build TWO recipes — recipe_each with RecipeIngredient(food=food_tomato, unit=unit_each, quantity=2) and recipe_grams with RecipeIngredient(food=food_tomato, unit=unit_gram, quantity=100); both units created with standard_unit=None. Schedule one of each, add both. Assert TWO distinct list items for food_tomato, one with unit_id == unit_each.id quantity == 2.0, one with unit_id == unit_gram.id quantity == 100.0; same food_id, distinct unit_id; len(listItems) == 2.",
+        "test_different_food_same_name: create two SaveIngredientFood(name='tomato', group_id=...) records (distinct UUIDs, identical name). Build two recipes each using a different food but same unit_each and quantity=2. Schedule one of each, add both. Assert TWO distinct list items, each with food.name == 'tomato' but DISTINCT food_id, each with quantity == 2.0; len(listItems) == 2. Confirms food_id (not display/name) is the merge key.",
+        "All four tests PASS after the US-3 fix."
+      ]
+    }
+  ],
+  "functional_requirements": [
+    {
+      "id": "FR-1",
+      "user_story": "US-1",
+      "description": "A new test file tests/integration_tests/user_household_tests/test_meal_plan_to_shopping_bug.py contains test_meal_plan_to_shopping_list_accumulates_duplicate_recipe_ingredients. Runnable via 'task py:test -- tests/integration_tests/user_household_tests/test_meal_plan_to_shopping_bug.py' or 'uv run pytest <path>'. Exercises the real HTTP route POST /api/households/shopping/lists/{item_id}/recipe and asserts per-food quantity and row-count invariants on the response of the subsequent GET /api/households/shopping/lists/{item_id}.",
+      "code_references": [
+        {"path": "mealie/routes/households/controller_shopping_lists.py", "line_ranges": [[256, 261]], "purpose": "Route under exercise: add_recipe_ingredients_to_list"},
+        {"path": "tests/utils/api_routes/__init__.py", "line_ranges": [[415, 417]], "purpose": "households_shopping_lists_item_id_recipe route helper"},
+        {"path": "tests/utils/api_routes/__init__.py", "line_ranges": [[405, 407]], "purpose": "households_shopping_lists_item_id helper"},
+        {"path": "tests/utils/api_routes/__init__.py", "line_ranges": [[92, 92]], "purpose": "households_mealplans route constant"},
+        {"path": "tests/fixtures/fixture_users.py", "line_ranges": [[179, 226]], "purpose": "unique_user fixture"},
+        {"path": "tests/fixtures/fixture_shopping_lists.py", "line_ranges": [[49, 65]], "purpose": "shopping_list fixture"},
+        {"path": "tests/conftest.py", "line_ranges": [[37, 54]], "purpose": "api_client fixture and DB override"}
+      ]
+    },
+    {
+      "id": "FR-2",
+      "user_story": "US-2",
+      "description": "PR description contains a '### Root cause' section answering (1) which function holds the bug with path:line, (2) which variant (A=overwrite-vs-accumulate at merge_items line 96, or B=wrong merge key at can_merge line 71), and (3) boundary cases. Variant labeling references input.md附录 patches. Boundary cases cover: same food+unit merges with sum; same food + different unit (standard_unit=None) does not merge; different food_id with same display does not merge; food_id is None falls back to note equality; recipe_scale accumulation produces a single ref with recipe_scale == N.",
+      "code_references": [
+        {"path": "mealie/services/household_services/shopping_lists.py", "line_ranges": [[45, 71]], "purpose": "can_merge predicate"},
+        {"path": "mealie/services/household_services/shopping_lists.py", "line_ranges": [[73, 128]], "purpose": "merge_items accumulator"},
+        {"path": "mealie/services/household_services/shopping_lists.py", "line_ranges": [[109, 126]], "purpose": "recipe_scale merge in merge_items"},
+        {"path": "input.md", "line_ranges": [[103, 128]], "purpose": "Variant A/B canonical patches"}
+      ]
+    },
+    {
+      "id": "FR-3",
+      "user_story": "US-3",
+      "description": "Diff modifies only mealie/services/household_services/shopping_lists.py. Within that file, only ShoppingListService.can_merge (lines 45-71) and/or ShoppingListService.merge_items (lines 73-128) are touched. Total changed lines <= 5. After the fix: can_merge keeps 'item1.food_id != item2.food_id' rejection at line 52, retains the standard_unit / UnitConverter branch (lines 57-68), and returns 'bool(item1.food_id) or item1.note == item2.note' at line 71. merge_items keeps 'to_item.quantity += from_item.quantity' at line 96, merge_quantity_and_unit branch (lines 86-92), note concatenation, extras update, and recipe-reference merge (lines 109-126) unchanged.",
+      "code_references": [
+        {"path": "mealie/services/household_services/shopping_lists.py", "line_ranges": [[45, 71]], "purpose": "can_merge — predicate to repair if Variant B"},
+        {"path": "mealie/services/household_services/shopping_lists.py", "line_ranges": [[73, 128]], "purpose": "merge_items — accumulator to repair if Variant A"},
+        {"path": "mealie/services/household_services/shopping_lists.py", "line_ranges": [[154, 223]], "purpose": "bulk_create_items — unchanged consumer"},
+        {"path": "mealie/services/household_services/shopping_lists.py", "line_ranges": [[413, 455]], "purpose": "add_recipe_ingredients_to_list — unchanged caller"}
+      ]
+    },
+    {
+      "id": "FR-4",
+      "user_story": "US-4",
+      "description": "Four regression tests are appended to test_meal_plan_to_shopping_bug.py with exact names and behaviors: test_single_occurrence, test_multiple_occurrences_same_unit (parametrized over [2, 3]), test_multiple_occurrences_different_units, test_different_food_same_name. Each asserts both per-item quantity AND len(listItems) count; each asserts food_id and unit_id on returned items (not just note/display) to lock the merge-key semantics.",
+      "code_references": [
+        {"path": "mealie/schema/household/group_shopping_list.py", "line_ranges": [[106, 120]], "purpose": "ShoppingListItemOut exposes food_id, unit_id, food, unit"},
+        {"path": "mealie/schema/household/group_shopping_list.py", "line_ranges": [[32, 46]], "purpose": "ShoppingListItemRecipeRefCreate.recipe_scale field"},
+        {"path": "tests/integration_tests/user_household_tests/test_group_shopping_lists.py", "line_ranges": [[663, 739]], "purpose": "Analogous prior test pattern to mirror (test_shopping_lists_add_recipes_with_merge)"},
+        {"path": "mealie/services/household_services/shopping_lists.py", "line_ranges": [[109, 126]], "purpose": "recipe_scale merge semantics under test"}
+      ]
+    },
+    {
+      "id": "FR-5",
+      "user_story": "US-3",
+      "description": "After the US-3 fix, all tests in test_group_shopping_lists.py, test_group_shopping_list_items.py, and test_group_mealplan.py PASS without modification. In particular, the existing merge tests test_shopping_lists_add_recipe_with_merge (lines 581-660), test_shopping_lists_add_recipes_with_merge (lines 663-739), and test_shopping_lists_add_nested_recipe_ingredients (lines 249-361) keep passing — confirming no regression of PR #5054 (bulk add), #4800 (recipe-as-ingredient), or #7121 (unit standardization).",
+      "code_references": [
+        {"path": "tests/integration_tests/user_household_tests/test_group_shopping_lists.py", "line_ranges": [[581, 660]], "purpose": "test_shopping_lists_add_recipe_with_merge"},
+        {"path": "tests/integration_tests/user_household_tests/test_group_shopping_lists.py", "line_ranges": [[663, 739]], "purpose": "test_shopping_lists_add_recipes_with_merge"},
+        {"path": "tests/integration_tests/user_household_tests/test_group_shopping_lists.py", "line_ranges": [[249, 361]], "purpose": "test_shopping_lists_add_nested_recipe_ingredients"},
+        {"path": "tests/integration_tests/user_household_tests/test_group_shopping_list_items.py", "line_ranges": [[644, 731]], "purpose": "Standard-unit merge tests must remain green"}
+      ]
+    },
+    {
+      "id": "FR-6",
+      "user_story": "non-functional",
+      "description": "Tests follow Mealie conventions: use unique_user + api_client fixtures; assert via utils.assert_deserialize(response, 200) (tests/utils/assertion_helpers.py:23-25); serialize bulk payloads via utils.jsonify([... .model_dump()]) (tests/utils/jsonify.py:1-5); deserialize list response via ShoppingListOut.model_validate(...) for typed access to food, unit, food_id, unit_id, recipe_references. Full validation is 'task py:check' (Taskfile.yml:122-128). Python entrypoints use uv (never python/pip).",
+      "code_references": [
+        {"path": "tests/utils/assertion_helpers.py", "line_ranges": [[23, 25]], "purpose": "assert_deserialize helper"},
+        {"path": "tests/utils/jsonify.py", "line_ranges": [[1, 5]], "purpose": "jsonify helper"},
+        {"path": "Taskfile.yml", "line_ranges": [[107, 110]], "purpose": "py:test command"},
+        {"path": "Taskfile.yml", "line_ranges": [[122, 128]], "purpose": "py:check command (format + lint + mypy + test)"},
+        {"path": "mealie/schema/household/group_shopping_list.py", "line_ranges": [[250, 285]], "purpose": "ShoppingListOut shape"}
+      ]
+    }
+  ],
+  "success_criteria": [
+    {"id": "SC-1", "metric": "test_meal_plan_to_shopping_list_accumulates_duplicate_recipe_ingredients exit status before fix", "threshold": "exit non-zero (FAIL)", "measurement": "uv run pytest tests/integration_tests/user_household_tests/test_meal_plan_to_shopping_bug.py::test_meal_plan_to_shopping_list_accumulates_duplicate_recipe_ingredients on the buggy HEAD"},
+    {"id": "SC-2", "metric": "Same test exit status after fix", "threshold": "exit zero (PASS)", "measurement": "Re-run after the US-3 patch"},
+    {"id": "SC-3", "metric": "All tests in test_meal_plan_to_shopping_bug.py pass", "threshold": "5/5 named tests PASS (parametrized expansion may yield more)", "measurement": "uv run pytest tests/integration_tests/user_household_tests/test_meal_plan_to_shopping_bug.py -v"},
+    {"id": "SC-4", "metric": "Pre-existing related tests still green", "threshold": "0 new failures across test_group_shopping_lists.py, test_group_shopping_list_items.py, test_group_mealplan.py", "measurement": "uv run pytest tests/integration_tests/user_household_tests/test_group_shopping_lists.py tests/integration_tests/user_household_tests/test_group_shopping_list_items.py tests/integration_tests/user_household_tests/test_group_mealplan.py"},
+    {"id": "SC-5", "metric": "Diff size in mealie/services/household_services/shopping_lists.py", "threshold": "<= 5 changed lines", "measurement": "git diff --shortstat HEAD~ -- mealie/services/household_services/shopping_lists.py"},
+    {"id": "SC-6", "metric": "Files modified in production code", "threshold": "exactly 1 (mealie/services/household_services/shopping_lists.py)", "measurement": "git diff --name-only HEAD~ -- mealie/"},
+    {"id": "SC-7", "metric": "task py:check exit status", "threshold": "zero", "measurement": "task py:check"}
+  ],
+  "edge_cases": [
+    {
+      "id": "EC-1",
+      "scenario": "Same food_id, different unit_id, neither unit has standard_unit",
+      "expected_behavior": "Two distinct rows (no merge).",
+      "source": "mealie/services/household_services/shopping_lists.py:57-68 — can_merge fails standard_unit check on both items and returns False."
+    },
+    {
+      "id": "EC-2",
+      "scenario": "Different food_id, identical food.name ('tomato' twice with distinct UUIDs)",
+      "expected_behavior": "Two distinct rows (no merge).",
+      "source": "mealie/services/household_services/shopping_lists.py:52 — can_merge rejects when item1.food_id != item2.food_id regardless of name/display."
+    },
+    {
+      "id": "EC-3",
+      "scenario": "Same recipe added N times via mixed recipe_increment_quantity (e.g. one bulk entry with 2 and one with 1)",
+      "expected_behavior": "One row per (food_id, unit_id) with quantity = base * 3; one recipe_references entry with recipe_scale == 3.0.",
+      "source": "mealie/services/household_services/shopping_lists.py:109-126 — merge_items sums recipe_scale per recipe_id."
+    },
+    {
+      "id": "EC-4",
+      "scenario": "Float-precision accumulation (e.g. 0.1 * 3 produces 0.30000000000000004)",
+      "expected_behavior": "Assertions use pytest.approx(..., abs=1e-6) or pytest.approx(..., rel=1e-6); quantities are persisted as raw float sums (no rounding after merge).",
+      "source": "mealie/db/models/household/shopping_list.py:67 (Float column); mealie/schema/recipe/recipe_ingredient.py:23 and 345-357 round INPUT to INGREDIENT_QTY_PRECISION=3 but merge_items line 96 does NOT round the SUM."
+    },
+    {
+      "id": "EC-5",
+      "scenario": "Recipe deleted between meal-plan creation and add-to-shopping-list",
+      "expected_behavior": "get_shopping_list_items_from_recipe raises UnexpectedNone('Recipe not found'); the new tests do NOT exercise this path (out of fix scope), but the spec documents it as an unchanged contract.",
+      "source": "mealie/services/household_services/shopping_lists.py:336-338"
+    },
+    {
+      "id": "EC-6",
+      "scenario": "food_id is None on both items (parsed/unparsed ingredient with no food)",
+      "expected_behavior": "Merges only when note matches (can_merge line 71 fallback: return bool(item1.food_id) or item1.note == item2.note).",
+      "source": "mealie/services/household_services/shopping_lists.py:70-71"
+    },
+    {
+      "id": "EC-7",
+      "scenario": "Recipe with internal duplicate ingredients AND recipe_increment_quantity > 1 (sub-recipe scaling)",
+      "expected_behavior": "The same-recipe pre-merge at lines 395-397 adds raw ingredient.quantity (not scaled); this is a separate latent issue documented in self_concerns, NOT fixed here.",
+      "source": "mealie/services/household_services/shopping_lists.py:393-397"
+    }
+  ],
+  "self_concerns": [
+    {
+      "id": "SCN-1",
+      "concern": "In-recipe duplicate scaling latent bug at get_shopping_list_items_from_recipe lines 395-397: existing_item.quantity += ingredient.quantity instead of ingredient.quantity * scale. With recipe_increment_quantity > 1 and internal duplicates, undercounts. OUT OF SCOPE for case 3 (different bug surface). Recommended follow-up: separate PR with its own reproduction test."
+    },
+    {
+      "id": "SCN-2",
+      "concern": "Float-precision accumulation not rounded after merge. merge_items line 96 produces raw float sums; INGREDIENT_QTY_PRECISION=3 only applies to input rounding, not consolidated sums. Tests in this spec use pytest.approx(..., abs=1e-6) to remain robust. A future enhancement could re-round at the persistence boundary — separate PR."
+    },
+    {
+      "id": "SCN-3",
+      "concern": "Future unit-conversion merge dimensions: PR #7121 made compatible standard_unit values merge. If a future PR adds more dimensions (e.g. fuzzy food matching by alias), test_multiple_occurrences_different_units must be re-evaluated. Spec uses standard_unit=None to insulate the regression."
+    }
+  ],
+  "out_of_scope": [
+    "Frontend code (frontend/) — bug is backend-only.",
+    "Refactoring bulk_create_items, bulk_update_items, get_shopping_list_items_from_recipe, or add_recipe_ingredients_to_list.",
+    "Any SQLAlchemy model, Alembic migration, repository, or Pydantic schema change.",
+    "Adding a dedicated meal-plan-to-shopping-list backend route.",
+    "Fixing in-recipe duplicate scaling latent bug (see SCN-1).",
+    "Re-rounding float sums after merge (see SCN-2).",
+    "Locale / translation file changes.",
+    "OpenAPI generation, TypeScript codegen, or test-helper generation (task dev:generate NOT required since no Pydantic schemas change)."
+  ],
+  "verification_commands": [
+    {"phase": "Pre-fix (US-1 baseline)", "command": "uv run pytest tests/integration_tests/user_household_tests/test_meal_plan_to_shopping_bug.py::test_meal_plan_to_shopping_list_accumulates_duplicate_recipe_ingredients -v", "expected": "1 failed"},
+    {"phase": "Post-fix (US-3 acceptance)", "command": "uv run pytest tests/integration_tests/user_household_tests/test_meal_plan_to_shopping_bug.py -v", "expected": "5 passed (or more with parametrization expansion)"},
+    {"phase": "Regression sweep", "command": "uv run pytest tests/integration_tests/user_household_tests/test_group_shopping_lists.py tests/integration_tests/user_household_tests/test_group_shopping_list_items.py tests/integration_tests/user_household_tests/test_group_mealplan.py", "expected": "0 new failures"},
+    {"phase": "Full validation", "command": "task py:check", "expected": "exit 0"},
+    {"phase": "Diff size check", "command": "git diff --shortstat HEAD~ -- mealie/services/household_services/shopping_lists.py", "expected": "<= 5 lines changed in 1 file"}
+  ],
+  "needs_clarification": []
+}

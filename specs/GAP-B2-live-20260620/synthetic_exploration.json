@@ -1,0 +1,195 @@
+{
+  "schema_version": "1.0",
+  "perspectives": [
+    {
+      "schema_version": "1.0",
+      "perspective_type": "data",
+      "relevant_artifacts": [
+        {
+          "path": "mealie/db/models/recipe.py",
+          "symbols": ["Recipe"],
+          "line_ranges": [[20, 80]],
+          "importance": "relevant",
+          "reason": "Recipe ORM model used by the feature",
+          "snippet": ""
+        },
+        {
+          "path": "mealie/db/models/group.py",
+          "symbols": ["Group"],
+          "line_ranges": [[10, 40]],
+          "importance": "relevant",
+          "reason": "Group ownership for recipe rows",
+          "snippet": ""
+        },
+        {
+          "path": "mealie/db/models/user.py",
+          "symbols": ["User"],
+          "line_ranges": [[5, 30]],
+          "importance": "relevant",
+          "reason": "User model linked to groups",
+          "snippet": ""
+        }
+      ],
+      "conventions_discovered": ["snake_case columns"],
+      "hypotheses_checked": [],
+      "notable_findings": [],
+      "open_questions": [],
+      "iterations_used": 1,
+      "tool_calls_used": 4
+    },
+    {
+      "schema_version": "1.0",
+      "perspective_type": "api",
+      "relevant_artifacts": [
+        {
+          "path": "mealie/services/scheduler/__init__.py",
+          "symbols": ["SchedulerService", "register_daily_task"],
+          "line_ranges": [[1, 10]],
+          "importance": "critical",
+          "reason": "Singleton scheduler service that the recurring-recipe feature must register tasks against; missing this means the feature cannot fire on the configured cadence.",
+          "snippet": ""
+        },
+        {
+          "path": "mealie/routes/recipe/recipe_controller.py",
+          "symbols": ["RecipeController"],
+          "line_ranges": [[50, 200]],
+          "importance": "relevant",
+          "reason": "Main HTTP entry point for recipe CRUD",
+          "snippet": ""
+        },
+        {
+          "path": "mealie/schema/recipe/recipe.py",
+          "symbols": ["RecipeOut"],
+          "line_ranges": [[100, 160]],
+          "importance": "relevant",
+          "reason": "Pydantic response model returned by the controller",
+          "snippet": ""
+        }
+      ],
+      "conventions_discovered": ["FastAPI routers in mealie/routes"],
+      "hypotheses_checked": [],
+      "notable_findings": [],
+      "open_questions": [],
+      "iterations_used": 1,
+      "tool_calls_used": 5
+    },
+    {
+      "schema_version": "1.0",
+      "perspective_type": "test",
+      "relevant_artifacts": [
+        {
+          "path": "tests/integration_tests/test_recipe.py",
+          "symbols": ["test_create_recipe"],
+          "line_ranges": [[1, 80]],
+          "importance": "relevant",
+          "reason": "Existing recipe integration test to extend",
+          "snippet": ""
+        },
+        {
+          "path": "tests/conftest.py",
+          "symbols": ["api_client"],
+          "line_ranges": [[1, 50]],
+          "importance": "relevant",
+          "reason": "Shared pytest fixtures",
+          "snippet": ""
+        },
+        {
+          "path": "tests/utils/factories.py",
+          "symbols": ["recipe_factory"],
+          "line_ranges": [[1, 40]],
+          "importance": "relevant",
+          "reason": "Factory helpers for building Recipe payloads in tests",
+          "snippet": ""
+        }
+      ],
+      "conventions_discovered": ["pytest fixtures via conftest"],
+      "hypotheses_checked": [],
+      "notable_findings": [],
+      "open_questions": [],
+      "iterations_used": 1,
+      "tool_calls_used": 3
+    },
+    {
+      "schema_version": "1.0",
+      "perspective_type": "history",
+      "relevant_artifacts": [
+        {
+          "path": "CHANGELOG.md",
+          "symbols": [],
+          "line_ranges": [[1, 30]],
+          "importance": "relevant",
+          "reason": "Recent recipe-related changes that may collide with this feature",
+          "snippet": ""
+        },
+        {
+          "path": "mealie/db/migrations/versions/2025_add_recipe.py",
+          "symbols": [],
+          "line_ranges": [[1, 60]],
+          "importance": "relevant",
+          "reason": "Most recent migration touching the Recipe table",
+          "snippet": ""
+        },
+        {
+          "path": "mealie/db/migrations/versions/2025_add_scheduler_jobs.py",
+          "symbols": [],
+          "line_ranges": [[1, 50]],
+          "importance": "relevant",
+          "reason": "Past addition of scheduler-related tables; useful pattern reference",
+          "snippet": ""
+        }
+      ],
+      "conventions_discovered": ["alembic versioned migrations"],
+      "hypotheses_checked": [],
+      "notable_findings": [],
+      "open_questions": [],
+      "iterations_used": 1,
+      "tool_calls_used": 2
+    },
+    {
+      "schema_version": "1.0",
+      "perspective_type": "ui",
+      "relevant_artifacts": [
+        {
+          "path": "frontend/pages/recipe/index.vue",
+          "symbols": ["RecipeListPage"],
+          "line_ranges": [[1, 120]],
+          "importance": "relevant",
+          "reason": "Main UI surface for recipes",
+          "snippet": ""
+        },
+        {
+          "path": "frontend/components/Domain/Recipe/RecipeCard.vue",
+          "symbols": ["RecipeCard"],
+          "line_ranges": [[1, 80]],
+          "importance": "relevant",
+          "reason": "Card component rendered for each recipe in the list",
+          "snippet": ""
+        },
+        {
+          "path": "frontend/composables/use-recipes.ts",
+          "symbols": ["useRecipes"],
+          "line_ranges": [[1, 60]],
+          "importance": "relevant",
+          "reason": "Composable that wraps the recipe API client",
+          "snippet": ""
+        }
+      ],
+      "conventions_discovered": ["composables under frontend/composables"],
+      "hypotheses_checked": [],
+      "notable_findings": [],
+      "open_questions": [],
+      "iterations_used": 1,
+      "tool_calls_used": 4
+    }
+  ],
+  "conflicts": [
+    {
+      "perspectives_involved": ["api", "data"],
+      "description": "api perspective claims RecipeOut.last_made is populated by the controller from a join, but the data perspective reports the column does not exist on the Recipe ORM model — disagreement on whether the field is computed or persisted.",
+      "resolution_suggestion": ""
+    }
+  ],
+  "consolidated_artifacts": [],
+  "consolidated_conventions": [],
+  "summary": "Synthetic exploration designed to exercise the B2 coverage-gap detector: one singleton critical artifact (api-only) and one unresolved conflict."
+}

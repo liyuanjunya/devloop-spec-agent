@@ -1,0 +1,212 @@
+{
+  "schema_version": "1.0",
+  "actions": [
+    {
+      "id": "META-001",
+      "priority": 1,
+      "severity": "critical",
+      "affected_axes": ["architecture", "completeness", "consistency"],
+      "source_issue_ids": ["ARCH-C-3", "COMP-C8", "CON-C-008"],
+      "description": "Pantry-staple state is modeled on group-scoped IngredientFoodModel.is_pantry_staple, so one household marking flour as a staple silently affects every other household in the group. This directly contradicts input §5 multitenant-isolation requirement and the household-facing language in US-4/US-7.",
+      "rationale": "Three independent axes (architecture, completeness, consistency) flag the same root cause: the spec selected a group-scoped column for what input.md:73-75 requires to be a per-household marker. NC-001 is currently 'recommended default = group-scoped', which is incompatible with the required behavior; shipping as-is would cause cross-household behavioral leakage and fail the mandated multitenant test.",
+      "suggested_action": "Resolve NC-001 BEFORE coding: add a household-food association table (parallel to households_to_ingredient_foods in mealie/db/models/recipe/ingredient.py:157-162) — e.g. household_pantry_staples(household_id, food_id) — and route the pantry-filter predicate through this scope. Update schemas/routes accordingly and add a test where households A and B in the same group set different staple state for the same food and observe no bleed-through.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-002",
+      "priority": 1,
+      "severity": "critical",
+      "affected_axes": ["architecture", "executability", "consistency"],
+      "source_issue_ids": ["ARCH-C-1", "EXEC-C-001", "CON-C-001", "CON-C-002"],
+      "description": "The CAS marker (last_auto_synced_at) is acquired before sync work, but Mealie repository methods commit inside bulk_create_items / add_recipe_ingredients_to_list. A mid-sync failure can leave the household marked synced with incomplete writes, and no-op runs (no meal plan / missing list) also burn the daily slot — contradicting the explicit edge-case rules that say no-op must not bump the marker.",
+      "rationale": "Three reviewers converge: architecture flags the commit-in-repository pattern (mealie/repos/repository_generic.py:195-203), executability flags FR-010 vs edge-cases timing contradiction, consistency flags both the day-boundary mismatch (FR-008 vs FR-010) and the CAS-before-work no-op problem. This is the canonical 'marker-before-work' idempotency bug and is blocking.",
+      "suggested_action": "Specify exact ordering: (1) resolve target list ownership and load today's meal plan first; (2) if no plan or no resolvable list, log + skip without touching marker; (3) wrap item-creation + recipe-reference + event dispatch in a single controlled transaction; (4) only after all writes succeed, set last_auto_synced_at via conditional UPDATE (with WHERE last_auto_synced_at IS NULL OR last_auto_synced_at < :scheduled_local_day). Add an explicit failure-injection test proving a mid-sync exception leaves the marker untouched so the next run retries.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-003",
+      "priority": 1,
+      "severity": "critical",
+      "affected_axes": ["architecture", "completeness", "executability", "consistency"],
+      "source_issue_ids": ["ARCH-H-2", "COMP-C1", "COMP-C2", "EXEC-C-002", "CON-C-001"],
+      "description": "The required per-household auto_sync_run_time (HH:MM, default '00:00') field is missing; the scheduler is registered as MINUTES_5 instead of every 30 minutes; the 'today' window is hardcoded to midnight; field naming diverges from input (auto_sync_meal_plan_to_shopping_list vs auto_sync_meal_plan_to_shopping); and the FR-008 30-min-before-midnight predicate is incompatible with the FR-010 today-midnight CAS predicate.",
+      "rationale": "Four axes flag overlapping aspects of one root design defect: the spec omitted auto_sync_run_time and then derived inconsistent gating logic. Input §1 (input.md:17-23) and §2 (input.md:30-38) make the field set and 30-minute cadence explicit. Without this fix, scheduler tests, PATCH support, migration, and window semantics are all wrong.",
+      "suggested_action": "Add auto_sync_run_time: str (HH:MM, default '00:00', validated). Register the task via the 30-minute scheduler bucket (or document the supported equivalent). Compute scheduled_local_instant = today_in_household_tz at auto_sync_run_time; gate execution to runs whose now() falls within [scheduled_local_instant, scheduled_local_instant + 30min). Unify the idempotency predicate to compare last_auto_synced_at against scheduled_local_instant's local date. Restore the input field name (or document a compatibility alias). Drop the extra auto_sync_pantry_filter_enabled flag (see META-005).",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-004",
+      "priority": 1,
+      "severity": "critical",
+      "affected_axes": ["architecture", "consistency"],
+      "source_issue_ids": ["ARCH-C-2", "CON-C-006"],
+      "description": "A configured auto_sync_target_shopping_list_id is passed directly to ShoppingListService.add_recipe_ingredients_to_list, which creates ShoppingListItem rows for the supplied list_id without verifying household ownership. A stale or maliciously-set cross-household id will write into another household's list, defeating multitenant isolation (US-6 / SC-006).",
+      "rationale": "Architecture and consistency both surface this: scoped repos protect the fallback path (FR-019) but NOT a pre-configured target id. Mealie's shopping-list service writes items before reading the list through the scoped repo, so the scoped-repo defense doesn't apply automatically.",
+      "suggested_action": "Add validation at TWO seams: (a) PATCH /households/preferences must reject auto_sync_target_shopping_list_id values that do not belong to the current household; (b) sync task must call repos.group_shopping_lists.get_one(target_id) via the household-scoped repository factory and abort (with the no-target-list i18n message) if missing. Add a multitenant test where household A configures B's list id and asserts zero rows change in B's list.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-005",
+      "priority": 1,
+      "severity": "critical",
+      "affected_axes": ["completeness", "executability", "consistency"],
+      "source_issue_ids": ["COMP-C3", "EXEC-H-001", "EXEC-H-002", "CON-C-004"],
+      "description": "Pantry filtering is incoherent: spec adds an optional auto_sync_pantry_filter_enabled gate (input requires unconditional filtering); FR-011 passes recipe_ingredients=None which delegates fetching to the existing helper and leaves nothing to pre-filter; FR-012 says pre-filter the list; sub-recipe (referenced recipe) expansion at shopping_lists.py:343-350 is not addressed.",
+      "rationale": "Three axes flag the same implementation seam contradiction. Without a single concrete pipeline, the coder will either (a) skip filtering entirely because recipe_ingredients=None, (b) filter top-level only and let sub-recipe staples leak, or (c) implement something inconsistent with the test suite.",
+      "suggested_action": "Remove auto_sync_pantry_filter_enabled — make pantry-staple filtering unconditional for auto-sync per input.md:41-44. Pin one implementation: fetch each recipe (and recursively expand referenced recipes) into a fully-materialized ingredient list, apply the per-household pantry-staple predicate from META-001, then call add_recipe_ingredients_to_list with an explicit recipe_ingredients= filtered list (NOT None). Cite get_shopping_list_items_from_recipe at L323-340 and the recursive expansion at L343-350. Add SC + test for sub-recipe staple filtering.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-006",
+      "priority": 1,
+      "severity": "critical",
+      "affected_axes": ["architecture", "completeness", "executability"],
+      "source_issue_ids": ["ARCH-H-1", "COMP-C6", "EXEC-H-003"],
+      "description": "Input §2 requires a NEW event MealPlanAutoSyncedToShopping with safe payload {household_id, shopping_list_id, added_item_count, skipped_pantry_count}. Spec instead dispatches the generic EventTypes.shopping_list_updated with EventShoppingListData carrying only shopping_list_id, and doesn't specify the required EventOperation field, so subscribers cannot distinguish auto-sync from any other list update.",
+      "rationale": "Three axes converge. The latent tension between ARCH-H-1 (new event type) and EXEC-H-003 (set operation on existing EventShoppingListData) resolves cleanly in favor of input's explicit naming requirement: add the new event type and still include the required operation field.",
+      "suggested_action": "Add EventTypes.mealplan_auto_synced_to_shopping in mealie/services/event_bus_service/event_types.py and define class EventMealPlanAutoSyncedData(EventDocumentDataBase) with operation: EventOperation, household_id: UUID4, shopping_list_id: UUID4, added_item_count: int, skipped_pantry_count: int — and NO recipe/ingredient/user-identifying fields. Update subscriber registration migration if needed. Cite EventDocumentDataBase at event_types.py:88-91 to anchor the operation field requirement.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-007",
+      "priority": 1,
+      "severity": "critical",
+      "affected_axes": ["completeness", "consistency"],
+      "source_issue_ids": ["COMP-C5", "CON-C-003"],
+      "description": "Manual run-now route, response, authorization, and idempotency semantics are wrong: spec uses /api/households/preferences/auto-sync/run-now (input requires /auto-sync-shopping/run-now), returns a vague localized success payload (input requires {added_count, skipped_pantry_count, target_list_id, run_at}), and reuses the daily-gated sync function so a post-scheduled run-now no-ops — contradicting US-3.",
+      "rationale": "Completeness and consistency both flag this. Input §3 (input.md:48-53) is unambiguous about the route, the four response fields, household-admin auth, and the explicit 'bypass LastAutoSyncedAt but still update it' semantic.",
+      "suggested_action": "Use the exact path POST /api/households/preferences/auto-sync-shopping/run-now. Add an explicit household-admin permission check. Define a force=True / manual-mode parameter on the shared sync function that bypasses the daily CAS guard but still writes last_auto_synced_at on success. Return the exact JSON shape {added_count, skipped_pantry_count, target_list_id, run_at} and add SC/tests asserting both the bypass and the count fields.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-008",
+      "priority": 2,
+      "severity": "high",
+      "affected_axes": ["consistency", "architecture"],
+      "source_issue_ids": ["CON-C-005"],
+      "description": "last_auto_synced_at is added to the preference schema AND covered by partial-PATCH semantics with NC-003 treating nullable fields as clearable. A client could clear or backdate the server-owned idempotency marker and break daily-sync guarantees.",
+      "rationale": "Single reviewer but logically severe: the entire idempotency story in META-002 depends on this field being server-owned. Architecture review's CAS recommendations are moot if a client can null the marker.",
+      "suggested_action": "Remove last_auto_synced_at from the client-writable PATCH/PUT schemas (HouseholdPreferencesUpdate / partial-update schema in META-012). Keep it in the read schema for diagnostics. Add SC asserting that PATCH attempts to set last_auto_synced_at are ignored or rejected.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-009",
+      "priority": 2,
+      "severity": "high",
+      "affected_axes": ["completeness", "executability", "consistency"],
+      "source_issue_ids": ["COMP-C7", "EXEC-M-002", "CON-C-007"],
+      "description": "i18n keys diverge from input AND are inconsistent within the spec: input requires auto-sync.no-meal-plan-today, auto-sync.no-target-list, auto-sync.already-synced-today; spec defines mealplan.auto-sync.success / .no-active-meal-plan / .target-shopping-list-not-found; summary/US-9 use underscore namespace mealplan.auto_sync.* while FR-016 uses hyphen mealplan.auto-sync.*.",
+      "rationale": "Three axes flag the same drift. Without a single key set, every implementation site and every test fixture will pick a different string.",
+      "suggested_action": "Adopt the three exact keys from input.md:55-59: auto-sync.no-meal-plan-today, auto-sync.no-target-list, auto-sync.already-synced-today. Pick ONE convention everywhere (recommend the hyphenated unqualified namespace as in input). Update summary, US-9, FR-016, SC-011, and edge cases. Add SC asserting that the three localized error responses use exactly these keys.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-010",
+      "priority": 2,
+      "severity": "high",
+      "affected_axes": ["completeness"],
+      "source_issue_ids": ["COMP-C4"],
+      "description": "Input §2 step 3 explicitly requires reusing the existing consolidate_ingredients function (with the case-3 fix). Spec cites bulk_create_items / can_merge / add_recipe_ingredients_to_list but never names or cites consolidate_ingredients as the shared (food_id, unit_id) consolidator.",
+      "rationale": "Implementation-constraint compliance: input.md:79-81 makes seam reuse mandatory ('必须复用'). Without an explicit citation, the coder may reimplement the merge logic and diverge from case-3's fix.",
+      "suggested_action": "Locate the consolidate_ingredients function in the Mealie tree, cite its full path:lines, and require its use in FR-011/FR-012. If the canonical equivalent has a different name in the current codebase, document the verified seam and add a test asserting (food_id, unit_id) consolidation parity.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-011",
+      "priority": 2,
+      "severity": "high",
+      "affected_axes": ["completeness"],
+      "source_issue_ids": ["COMP-C9"],
+      "description": "Test matrix omits required cases: disabled-scheduled-skip, 204/0-added-no-meal-plan integration, cross-group isolation, pantry-staple cross-household isolation, scheduler-mock 30-minute interval assertion, and exact manual-trigger response-count assertions.",
+      "rationale": "Input §5 (input.md:60-75) enumerates the test bullets that must be covered; the spec lists generic categories but misses these specific cases. Per the completeness gate these are critical.",
+      "suggested_action": "Add one SC + one test per missing bullet: (a) unit/integration: disabled household skipped by scheduler; (b) integration: no-meal-plan day returns 204 or 0 added; (c) multitenant: cross-group complete isolation; (d) multitenant: per-household pantry-staple isolation (depends on META-001); (e) scheduler-mock: registration cadence is 30 minutes; (f) integration: manual run-now response contains exact added_count / skipped_pantry_count values.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-012",
+      "priority": 3,
+      "severity": "medium",
+      "affected_axes": ["architecture"],
+      "source_issue_ids": ["ARCH-M-1"],
+      "description": "PATCH partial-update semantics are left fuzzy. Mealie's generic update path uses model_dump() (full update), which would reset unspecified preferences to defaults — incompatible with FR-005's exclude_unset intent.",
+      "rationale": "Without an explicit partial schema, the coder will route PATCH through the existing generic update and silently overwrite untouched fields. Also blocks META-008 (excluding server-owned fields from writes).",
+      "suggested_action": "Define HouseholdPreferencesPartialUpdate schema with all fields Optional[...] = None, EXCLUDING server-owned last_auto_synced_at. Apply via model_dump(exclude_unset=True) and merge into the loaded row instead of routing through repository_generic.update().",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-013",
+      "priority": 3,
+      "severity": "medium",
+      "affected_axes": ["executability"],
+      "source_issue_ids": ["EXEC-M-001"],
+      "description": "FR-019 fallback (when no target id is configured) cites only the ShoppingListItem model; no repository call or SQLAlchemy query is named for 'first household shopping list ordered by created_at'.",
+      "rationale": "Single reviewer, but blocks executability: without the concrete repo seam, the coder must invent one and may forget household scoping or non-deleted filters.",
+      "suggested_action": "Cite the exact repo method or query: e.g. repos.group_shopping_lists.query(order_by=ShoppingList.created_at).first() or the equivalent in mealie/repos/repository_shopping_list.py. Cite ShoppingList model at mealie/db/models/household/shopping_list.py:147-181 and the created_at mixin at mealie/db/models/_model_base.py:18-23.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-014",
+      "priority": 3,
+      "severity": "medium",
+      "affected_axes": ["completeness"],
+      "source_issue_ids": ["COMP-M1"],
+      "description": "Input requires appended items mark recipe_references linking back to meal plan / recipe. Spec relies on existing recipe-id-only references and doesn't state whether meal-plan-entry identity is also persisted (or impossible in the current model).",
+      "rationale": "Ambiguity here will lead to under-/over-implementation. Either current recipe-only refs satisfy the requirement, or an extras/metadata strategy is needed.",
+      "suggested_action": "Verify in the model layer whether ShoppingListItem.recipe_references can carry a meal-plan-entry id. If not, either document that recipe-only refs satisfy the spirit of the requirement (with rationale) or specify an extras dict / new column to carry meal_plan_entry_id. Add SC/test accordingly.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-015",
+      "priority": 3,
+      "severity": "medium",
+      "affected_axes": ["completeness"],
+      "source_issue_ids": ["COMP-M2"],
+      "description": "Input requires appended items merge into existing unchecked same-(food_id, unit_id) rows by accumulating quantity rather than creating duplicates. Spec mentions checked rows are not merged but never explicitly requires the unchecked-accumulation behavior.",
+      "rationale": "Without an explicit FR + test, the coder may always create new rows and let users see duplicates after auto-sync.",
+      "suggested_action": "Add FR: 'For each filtered ingredient, if the target list contains an unchecked item with matching (food_id, unit_id), accumulate quantity and preserve/merge recipe_references; otherwise create a new item.' Add SC + integration test exercising both branches.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-016",
+      "priority": 3,
+      "severity": "medium",
+      "affected_axes": ["completeness"],
+      "source_issue_ids": ["COMP-M3"],
+      "description": "Input §4 requires migration + schema + repo + admin/foods routes for Food.is_pantry_staple. Spec covers model/schema/migration but says no repo method is needed and uses can_organize permission rather than naming an admin-foods route/permission.",
+      "rationale": "Underspecified permission and route surface will cause the coder to bolt the field onto whatever existing CRUD path exists, possibly without admin gating.",
+      "suggested_action": "State the intended permission explicitly (e.g. household admin or group admin), name the route(s) where pantry-staple toggle is exposed (admin/foods or similar), and confirm whether a repo method is needed for read/update beyond the generic CRUD. NOTE: this overlaps with META-001 — pantry-staple state should be per-household, so the admin endpoint should write to the household-pantry-staple association, not to a Food column.",
+      "conflicts_with": ["META-001"]
+    },
+    {
+      "id": "META-017",
+      "priority": 3,
+      "severity": "medium",
+      "affected_axes": ["executability"],
+      "source_issue_ids": ["EXEC-WRONG-CITATIONS"],
+      "description": "Several FR citations are wrong or incomplete: FR-019 cites ShoppingListItem instead of ShoppingList for created_at fallback; FR-018 cites only upgrade() of the example migration, missing the downgrade pair; FR-015 cites EventShoppingListData but not the inherited EventOperation field from EventDocumentDataBase.",
+      "rationale": "Executability gate requires precise citations so the coder hits the right symbols. These mis-citations would route the coder to wrong files or incomplete patterns.",
+      "suggested_action": "Update code_references for FR-019 to cite mealie/db/models/household/shopping_list.py:147-181 (ShoppingList) and mealie/db/models/_model_base.py:18-23 (created_at). For FR-018 add the downgrade range L35-45 of the announcements migration example. For FR-015 add mealie/services/event_bus_service/event_types.py:88-91 (EventDocumentDataBase.operation). Update both spec.md and spec.json so code_references remain identical.",
+      "conflicts_with": []
+    },
+    {
+      "id": "META-018",
+      "priority": 4,
+      "severity": "medium",
+      "affected_axes": ["consistency"],
+      "source_issue_ids": ["CON-C-009"],
+      "description": "FR↔SC bidirectional links are asymmetric in spec.json (FR-020 lists SC-001/002/003/008 but those SCs don't list FR-020 back) and absent from spec.md (FR entries link only related_user_stories there).",
+      "rationale": "Low impact on correctness but affects traceability and breaks any downstream tooling that walks the graph in both directions.",
+      "suggested_action": "Either (a) reciprocate the FR-020 links from SC-001/002/003/008.related_requirements, or (b) drop FR-020's outbound SC links and recast it as a pure test-coverage NFR. Optionally surface FR↔SC links in spec.md to match spec.json field parity.",
+      "conflicts_with": []
+    }
+  ],
+  "cross_axis_conflicts": [
+    "Latent (resolved in META-006): architecture review wants a NEW event type MealPlanAutoSyncedToShopping (ARCH-H-1) while executability review wants the existing EventShoppingListData enriched with an explicit EventOperation field (EXEC-H-003). Resolution: input.md:45-47 mandates the new event name, so add the new EventTypes member and dedicated payload class, AND include the operation field on the new payload (inherited from EventDocumentDataBase).",
+    "Latent (resolved in META-002): architecture says set last_auto_synced_at only AFTER all work succeeds (ARCH-C-1) while spec FR-010 says CAS-UPDATE before reading meal plans to claim the slot. Consistency reviewer's compromise (CON-C-002) is canonical: resolve target/meal preconditions first, then perform CAS immediately before the append + event-dispatch transaction. This yields both safety against concurrent replicas and correct no-op semantics.",
+    "Latent (resolved in META-005 + META-001): completeness says make pantry filtering unconditional (drop the auto_sync_pantry_filter_enabled gate) while architecture says model pantry-staple state per household. Both are required and compatible — the optional gating flag must go AND the underlying boolean must become household-scoped. The new per-household association table is the single source of truth used by the unconditional filter.",
+    "Latent (META-016 vs META-001): completeness flags an under-specified Food.is_pantry_staple admin route, but architecture mandates moving pantry-staple state OFF the Food row entirely. Resolution: implement META-001 first; the admin endpoint should write to the new household-pantry-staple association rather than to a Food column. META-016 should be reframed to specify the admin endpoint on the new association.",
+    "No reviewer-vs-reviewer substantive conflict was found — all four axes converge on the same core defects (multitenant pantry scoping, CAS/marker timing, 30-minute window + auto_sync_run_time, target-list ownership, pantry-filter implementation seam, event payload, manual-trigger route). Disagreements are about WHICH layer to fix, not WHETHER to fix."
+  ],
+  "summary": "v1 spec FAILS across all four axes with strong convergence on 7 critical defects. Architecture's 3 critical + 2 high are the correct priority-1 set, but completeness and consistency surface 4 additional critical actions (META-005 pantry-filter seam, META-006 event payload, META-007 manual-trigger route, plus they amplify META-001/META-003 as critical). 18 deduped actions total: 7 critical (P1), 4 high (P2), 6 medium (P3), 1 low (P4). Recommended fix order: META-001 (per-household pantry model — unblocks META-005, META-011, META-016) → META-002 (CAS ordering) → META-003 (run_time + 30-min window) → META-004 (target ownership) → META-005 (pantry filter implementation) → META-006 (event type) → META-007 (manual trigger). No reviewer-vs-reviewer conflicts; all four latent cross-axis tensions resolve cleanly in the merged actions above.",
+  "judge_model": "claude-opus-4.7"
+}
